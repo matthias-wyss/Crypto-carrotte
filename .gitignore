@@ -1,0 +1,24 @@
+# Environnements virtuels
+env/
+.venv/
+
+# Caches Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Fichiers de métadonnées Spotlight
+.Spotlight-V100
+
+# Fichiers de métadonnées Time Machine
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+
+# Logs, bases de données, etc.
+*.log
+*.sqlite3
