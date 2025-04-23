@@ -42,7 +42,10 @@ class CoinGlassAPI:
             data = response.json()
 
             if data["code"] != "0":
-                raise ValueError(f"API Error: {data['msg']}")
+                # raise ValueError(f"API Error: {data['msg']}")
+                print(f"API Error: {data['msg']}")
+                return pd.DataFrame()
+            
             
             # Flatten the nested dict into a list of records
             records = []
@@ -80,8 +83,10 @@ class CoinGlassAPI:
             data = response.json()
             
             if data['code'] != '0':
-                raise ValueError(f"API Error: {data['msg']}")
-                
+                # raise ValueError(f"API Error: {data['msg']}")
+                print(f"API Error: {data['msg']}")
+                return pd.DataFrame()
+                    
             # Process the OHLC data
             ohlc_data = data['data']
             if not ohlc_data:
@@ -119,7 +124,9 @@ class CoinGlassAPI:
             data = response.json()
             
             if data['code'] != '0':
-                raise ValueError(f"API Error: {data['msg']}")
+                # raise ValueError(f"API Error: {data['msg']}")
+                print(f"API Error: {data['msg']}")
+                return pd.DataFrame()
                 
             # Process the OHLC data
             ohlc_data = data['data']
@@ -230,7 +237,6 @@ def load_data_for_exchange_pair(
 
 def compute_funding_performance_multi_exchange(
     api_key: str,
-    base_asset: str,  # 'BTC' or 'ETH'
     start_str: str,
     end_str: str,
     interval: str,
@@ -243,7 +249,6 @@ def compute_funding_performance_multi_exchange(
     
     Parameters:
         api_key: str - Your CoinGlass API key
-        base_asset: str - Base asset ('BTC' or 'ETH')
         start_str: str - Start datetime as string
         end_str: str - End datetime as string
         interval: str - Time interval (e.g., '1h')
@@ -263,41 +268,65 @@ def compute_funding_performance_multi_exchange(
         print("Error: Could not load ticker mappings")
         return pd.DataFrame()
     
-    # Filter for the specified base asset
-    spot_tickers = spot_tickers[spot_tickers['baseAsset'] == base_asset]
-    perp_tickers = perp_tickers[perp_tickers['baseAsset'] == base_asset]
-    
     results = []
     
-    # For each perpetual futures exchange
+    # For each perpetual futures exchange/ticker
     for _, perp_row in perp_tickers.iterrows():
         perp_exchange = perp_row['exchange']
-        perp_symbol = perp_row['instrumentId']
+        perp_symbol = perp_row['futuresInstrumentId']
+        perp_base_asset = perp_row['baseAsset']
         
         print(f"\nProcessing perpetual futures on {perp_exchange} for {perp_symbol}")
         
-        # Find spot exchanges with data for this asset
-        for _, spot_row in spot_tickers.iterrows():
+        # Get funding rates for this perpetual
+        funding_df = api.get_funding_rates(
+            perp_symbol, 
+            start_str, 
+            end_str, 
+            perp_exchange, 
+            interval, 
+            limit
+        )
+        
+        if funding_df.empty:
+            print(f"No funding rate data available for {perp_symbol} on {perp_exchange}")
+            continue
+            
+        funding_df['perp_exchange'] = perp_exchange
+        funding_df['perp_symbol'] = perp_symbol
+        funding_df['baseAsset'] = perp_base_asset
+        
+        # Find spot exchanges with data for the same base asset
+        matching_spots = spot_tickers[spot_tickers['baseAsset'] == perp_base_asset]
+        
+        for _, spot_row in matching_spots.iterrows():
             spot_exchange = spot_row['exchange']
-            spot_symbol = spot_row['instrumentId']
+            spot_symbol = spot_row['spotInstrumentId']
             
             print(f"Pairing with spot data from {spot_exchange} for {spot_symbol}")
             
-            # Load and merge data
-            merged_df = load_data_for_exchange_pair(
-                api, 
-                spot_exchange, 
+            # Get spot prices
+            spot_df = api.get_spot_prices(
                 spot_symbol, 
-                perp_exchange, 
-                perp_symbol,
                 start_str, 
                 end_str, 
+                spot_exchange, 
                 interval, 
-                limit,
-                save_files
+                limit
             )
             
+            if spot_df.empty:
+                print(f"No spot data available for {spot_symbol} on {spot_exchange}")
+                continue
+                
+            spot_df['spot_exchange'] = spot_exchange
+            spot_df['spot_symbol'] = spot_symbol
+            
+            # Merge on timestamp
+            merged_df = pd.merge(spot_df, funding_df, on=['date', 'timestamp'], how='inner')
+            
             if merged_df.empty:
+                print(f"No matching timestamps between spot and funding data for {spot_exchange}/{perp_exchange}")
                 continue
                 
             # Compute funding PnL
@@ -310,6 +339,9 @@ def compute_funding_performance_multi_exchange(
             
             # Add to results
             results.append(merged_df)
+            
+            if save_files:
+                merged_df.to_csv(f'{spot_exchange}_{perp_exchange}_{perp_base_asset}.csv', index=False)
     
     if not results:
         print("No valid data pairs found across exchanges")
@@ -320,7 +352,8 @@ def compute_funding_performance_multi_exchange(
     
     return combined_df
 
-def calculate_performance_metrics(df: pd.DataFrame) -> pd.DataFrame:
+
+def calculate_performance_metrics(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     """
     Calculate performance metrics for each exchange pair
     
