@@ -250,6 +250,69 @@ def load_data_for_exchange_pair(
     
     return merged_df
 
+def load_future_data_for_exchange_pair(
+    api: CoinGlassAPI,
+    perp_exchange: str,
+    perp_symbol: str,
+    start_str: str,
+    end_str: str,
+    interval: str,
+    limit: int,
+    save_files: bool = False
+) -> pd.DataFrame:
+    """
+    Loads funding rates for a given exchange pair and merges them.
+    
+    Parameters:
+        api: CoinGlassAPI - API instance
+        perp_exchange: str - Exchange for perpetual futures data
+        perp_symbol: str - Symbol for perpetual futures data
+        start_str: str - Start date
+        end_str: str - End date
+        interval: str - Time interval
+        limit: int - Data point limit
+        save_files: bool - Whether to save intermediate files
+        
+    Returns:
+        DataFrame with funding data
+    """
+    
+    # Get funding rates
+    funding_df = api.get_full_funding_rates(perp_symbol, start_str, end_str, perp_exchange, interval, limit)
+    
+    if funding_df.empty:
+        print(f"No funding rate data available for {perp_symbol} on {perp_exchange}")
+        return pd.DataFrame()
+    
+    # Add exchange identifiers
+    funding_df['perp_exchange'] = perp_exchange
+    funding_df['perp_symbol'] = perp_symbol
+
+    if save_files:
+        funding_df.to_csv(f'./data/funding_rates/{perp_exchange}_{perp_symbol}_{interval}_funding_rates.csv', index=False)
+    
+    # # Merge on timestamp (retain all relevant columns)
+    # merged_df = pd.merge(
+    #     spot_df,
+    #     funding_df,
+    #     on=['date', 'timestamp'],
+    #     how='inner'
+    # )
+    
+    # if merged_df.empty:
+    #     print(f"No matching timestamps between spot and funding data for {spot_exchange}/{perp_exchange}")
+    #     return pd.DataFrame()
+    
+    # Include all columns in the merged DataFrame
+    # merged_df = merged_df[[
+    #     'date', 'timestamp', 'FR_open', 'FR_close', 'FR_high', 'FR_low',
+    #     'spot_exchange', 'spot_symbol', 'perp_exchange', 'perp_symbol'
+    # ]]
+    
+    # return merged_df
+
+    return funding_df
+
 def compute_funding_performance_multi_exchange(
     api_key: str,
     start_str: str,
