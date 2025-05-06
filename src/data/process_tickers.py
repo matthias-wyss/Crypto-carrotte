@@ -27,7 +27,7 @@ def process_tickers_separately(
         pd.DataFrame - Combined DataFrame of all results
     """
 
-    MAX_CALL_PER_MINUTE = 25  # Has to keep below the 30 calls per minute limit
+    MAX_CALL_PER_MINUTE = 30  # Has to keep below the 30 calls per minute limit
 
     results = []
     call_count = 0
