@@ -116,9 +116,6 @@ class CoinGlassAPI:
         start_ts = int(pd.to_datetime(start_str).timestamp()) #-9223372036854776
         end_ts = int(pd.to_datetime(end_str).timestamp()) #9223372036854776
 
-
-        print(f"start_ts: {start_ts}, end_ts: {end_ts}") # todo remove after debugging
-
         endpoint = f"{self.base_url}/api/futures/fundingRate/ohlc-history?exchange={exchange}&symbol={symbol}&type=futures&interval={interval}&limit={limit}&startTime={start_ts}&endTime={end_ts}"
    
         try:
