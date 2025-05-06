@@ -216,7 +216,8 @@ def load_data_for_exchange_pair(
         return pd.DataFrame()
     
     if save_files:
-        spot_df.to_csv(f'./data/spot_prices/{spot_exchange}_{spot_symbol}_{interval}_spot_prices.csv', index=False)
+        sanitized_symbol = spot_symbol.replace('/', '')  # Remove '/' from the symbol
+        spot_df.to_csv(f'./data/spot_prices/{spot_exchange}_{sanitized_symbol}_{interval}_spot_prices.csv', index=False)
     
     # Get funding rates
     funding_df = api.get_full_funding_rates(perp_symbol, start_str, end_str, perp_exchange, interval, limit)
@@ -356,7 +357,8 @@ def load_spot_data_for_exchange_pair(
     spot_df['spot_symbol'] = spot_symbol
 
     if save_files:
-        spot_df.to_csv(f'./data/spot_prices/{spot_exchange}_{spot_symbol}_{interval}_spot_prices.csv', index=False)
+        sanitized_symbol = spot_symbol.replace('/', '')  # Remove '/' from the symbol
+        spot_df.to_csv(f'./data/spot_prices/{spot_exchange}_{sanitized_symbol}_{interval}_spot_prices.csv', index=False)
     
     # # Merge on timestamp (retain all relevant columns)
     # merged_df = pd.merge(
