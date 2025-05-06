@@ -66,7 +66,7 @@ class CoinGlassAPI:
             print(f"Request error: {e}")
             return pd.DataFrame()
 
-    def get_spot_prices(self, symbol: str, start_str: str, end_str: str, exchange: str, interval: str, limit: int) -> pd.DataFrame:
+    def get_full_spot_prices(self, symbol: str, start_str: str, end_str: str, exchange: str, interval: str, limit: int) -> pd.DataFrame:
         """
         Downloads historical OHLC spot price data for a given symbol from CoinGlass API.
         """
@@ -98,8 +98,12 @@ class CoinGlassAPI:
             # Convert timestamp and format data
             df['date'] = pd.to_datetime(df['t'], unit='s')
             df["timestamp"] = df['t']
-            df["closePrice"] = df["c"].astype(float)
-            df = df[['date', 'timestamp', 'closePrice']]
+            df["SP_open"] = df["o"].astype(float)
+            df["SP_close"] = df["c"].astype(float)
+            df["SP_high"] = df["h"].astype(float)
+            df["SP_low"] = df["l"].astype(float)
+            df["SP_vol"] = df["v"].astype(float)
+            df = df[['date', 'timestamp', 'SP_open', 'SP_close', 'SP_high', 'SP_low', 'SP_vol']]
             
             return df
             
@@ -205,7 +209,7 @@ def load_data_for_exchange_pair(
         DataFrame with merged spot and funding data
     """
     # Get spot prices
-    spot_df = api.get_spot_prices(spot_symbol, start_str, end_str, spot_exchange, interval, limit)
+    spot_df = api.get_full_spot_prices(spot_symbol, start_str, end_str, spot_exchange, interval, limit) 
     
     if spot_df.empty:
         print(f"No spot data available for {spot_symbol} on {spot_exchange}")
@@ -244,8 +248,8 @@ def load_data_for_exchange_pair(
     
     # Include all columns in the merged DataFrame
     merged_df = merged_df[[
-        'date', 'timestamp', 'FR_open', 'FR_close', 'FR_high', 'FR_low',
-        'spot_exchange', 'spot_symbol', 'perp_exchange', 'perp_symbol'
+        'date', 'timestamp', 'SP_open', 'SP_close', 'SP_high', 'SP_low', 'SP_vol', 'spot_exchange', 'spot_symbol', 
+        'FR_open', 'FR_close', 'FR_high', 'FR_low', 'perp_exchange', 'perp_symbol'
     ]]
     
     return merged_df
@@ -312,6 +316,69 @@ def load_future_data_for_exchange_pair(
     # return merged_df
 
     return funding_df
+
+def load_spot_data_for_exchange_pair(
+    api: CoinGlassAPI,
+    spot_exchange: str,
+    spot_symbol: str,
+    start_str: str,
+    end_str: str,
+    interval: str,
+    limit: int,
+    save_files: bool = False
+) -> pd.DataFrame:
+    """
+    Loads funding rates for a given exchange pair and merges them.
+    
+    Parameters:
+        api: CoinGlassAPI - API instance
+        perp_exchange: str - Exchange for perpetual futures data
+        perp_symbol: str - Symbol for perpetual futures data
+        start_str: str - Start date
+        end_str: str - End date
+        interval: str - Time interval
+        limit: int - Data point limit
+        save_files: bool - Whether to save intermediate files
+        
+    Returns:
+        DataFrame with funding data
+    """
+    
+    # Get spot prices
+    spot_df = api.get_full_spot_prices(spot_symbol, start_str, end_str, spot_exchange, interval, limit)
+    
+    if spot_df.empty:
+        print(f"No spot price data available for {spot_symbol} on {spot_exchange}")
+        return pd.DataFrame()
+    
+    # Add exchange identifiers
+    spot_df['spot_exchange'] = spot_exchange
+    spot_df['spot_symbol'] = spot_symbol
+
+    if save_files:
+        spot_df.to_csv(f'./data/spot_prices/{spot_exchange}_{spot_symbol}_{interval}_spot_prices.csv', index=False)
+    
+    # # Merge on timestamp (retain all relevant columns)
+    # merged_df = pd.merge(
+    #     spot_df,
+    #     funding_df,
+    #     on=['date', 'timestamp'],
+    #     how='inner'
+    # )
+    
+    # if merged_df.empty:
+    #     print(f"No matching timestamps between spot and funding data for {spot_exchange}/{perp_exchange}")
+    #     return pd.DataFrame()
+    
+    # Include all columns in the merged DataFrame
+    # merged_df = merged_df[[
+    #     'date', 'timestamp', 'FR_open', 'FR_close', 'FR_high', 'FR_low',
+    #     'spot_exchange', 'spot_symbol', 'perp_exchange', 'perp_symbol'
+    # ]]
+    
+    # return merged_df
+
+    return spot_df
 
 def compute_funding_performance_multi_exchange(
     api_key: str,
@@ -384,7 +451,7 @@ def compute_funding_performance_multi_exchange(
             print(f"Pairing with spot data from {spot_exchange} for {spot_symbol}")
             
             # Get spot prices
-            spot_df = api.get_spot_prices(
+            spot_df = api.get_full_spot_prices(
                 spot_symbol, 
                 start_str, 
                 end_str, 
@@ -412,7 +479,7 @@ def compute_funding_performance_multi_exchange(
             merged_df['cumulativeFundingPnL'] = merged_df['fundingPnL'].cumsum()
             
             # Compute percentage return based on initial spot value
-            initial_value = merged_df['closePrice'].iloc[0] * position_size
+            initial_value = merged_df['SP_close'].iloc[0] * position_size
             merged_df['cumulativeReturnPct'] = 100 * merged_df['cumulativeFundingPnL'] / initial_value
             
             # Add to results
