@@ -1,9 +1,17 @@
 import pandas as pd
 import requests
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 from pathlib import Path
+import pandas as pd
+import os
+import glob
+import re
+from typing import Dict, List, Tuple, Optional
+import matplotlib.pyplot as plt
+
+
 
 
 class CoinGlassAPI:
@@ -597,4 +605,197 @@ def analyze_venue_switching_strategy(metrics_df: pd.DataFrame) -> pd.DataFrame:
 
 
 
+#Added by Loris to compute carry trade performance
 
+def merge_and_compute_carry_trade(
+    spot_df: pd.DataFrame,
+    futures_df: pd.DataFrame,
+    merge_on: str = 'timestamp'
+) -> pd.DataFrame:
+    """
+    Merge spot and futures dataframes and compute delta-neutral carry trade performance.
+    Strategy: Long spot, Short futures (equal notional amounts)
+    
+    Parameters:
+        spot_df: pd.DataFrame with columns: date, timestamp, SP_open, SP_close, etc.
+        futures_df: pd.DataFrame with columns: date, timestamp, FR_open, FR_close, etc.
+        merge_on: str - Column to merge on ('date' or 'timestamp')
+            
+    Returns:
+        pd.DataFrame: Merged DataFrame with carry trade performance metrics
+    """
+    # Ensure timestamp is numeric in both dataframes
+    if merge_on == 'timestamp':
+        spot_df['timestamp'] = pd.to_numeric(spot_df['timestamp'], errors='coerce')
+        futures_df['timestamp'] = pd.to_numeric(futures_df['timestamp'], errors='coerce')
+    
+    # Sort both dataframes by merge column
+    spot_df = spot_df.sort_values(by=merge_on)
+    futures_df = futures_df.sort_values(by=merge_on)
+    
+    # Remove duplicates if any
+    spot_df = spot_df.drop_duplicates(subset=[merge_on])
+    futures_df = futures_df.drop_duplicates(subset=[merge_on])
+    
+    # Merge dataframes
+    merged_df = pd.merge(
+        spot_df,
+        futures_df,
+        on=merge_on,
+        how='inner'
+    )
+    
+    # If date_x and date_y columns exist after merge, keep only one
+    if 'date_x' in merged_df.columns and 'date_y' in merged_df.columns:
+        merged_df['date'] = pd.to_datetime(merged_df['date_x'])
+        merged_df = merged_df.drop(columns=['date_x', 'date_y'])
+    elif 'date' in merged_df.columns:
+        merged_df['date'] = pd.to_datetime(merged_df['date'])
+    
+    # Position size (in units of the asset)
+    position_size = 1
+    
+    # Calculate initial value
+    initial_spot_price = merged_df['SP_close'].iloc[0]
+    
+    # Check if funding rates are in the correct format (should be decimal, e.g., 0.01 for 1%)
+    # If funding rates are too high, they might be in percentage points already
+    if 'FR_close' in merged_df.columns:
+        # If max funding rate is > 0.1 (10%), it might be in percentage points
+        if merged_df['FR_close'].abs().max() > 0.1:
+            merged_df['FR_close'] = merged_df['FR_close'] / 100
+    
+    # Calculate funding PnL (we receive funding when shorting futures if FR is positive)
+    # For a delta-neutral strategy, we short futures with the same notional value as our spot position
+    # Note: Funding rates are typically expressed as 8-hour rates, but our data might be daily
+    # Check if we need to adjust the frequency
+    
+    # Determine if funding rates are 8-hourly or daily
+    funding_frequency = 1  # Default: assume 3 funding periods per day (8-hourly)
+    
+    # If the data is daily and funding rates are 8-hourly, we need to adjust
+    # For daily data, we multiply by funding_frequency to get the daily equivalent
+    
+    # Calculate funding PnL - when shorting futures:
+    # - Positive funding rate: we RECEIVE funding (positive PnL)
+    # - Negative funding rate: we PAY funding (negative PnL)
+    merged_df['funding_pnl'] = merged_df['FR_close'] * merged_df['SP_close'] * position_size / funding_frequency
+    
+    # Calculate spot staking yield (if available, otherwise 0)
+    if 'spot_yield' in merged_df.columns:
+        merged_df['spot_yield_pnl'] = merged_df['spot_yield'] * merged_df['SP_close'] * position_size
+    else:
+        merged_df['spot_yield_pnl'] = 0
+    
+    # Calculate total PnL for each day
+    merged_df['daily_pnl'] = merged_df['funding_pnl'] + merged_df['spot_yield_pnl']
+    
+    # Calculate cumulative PnL
+    merged_df['cumulative_funding_pnl'] = merged_df['funding_pnl'].cumsum()
+    merged_df['cumulative_spot_yield_pnl'] = merged_df['spot_yield_pnl'].cumsum()
+    merged_df['cumulative_total_pnl'] = merged_df['daily_pnl'].cumsum()
+    
+    # Calculate returns as percentage of initial investment
+    merged_df['funding_return'] = merged_df['cumulative_funding_pnl'] / (initial_spot_price * position_size)
+    merged_df['spot_yield_return'] = merged_df['cumulative_spot_yield_pnl'] / (initial_spot_price * position_size)
+    merged_df['total_return'] = merged_df['cumulative_total_pnl'] / (initial_spot_price * position_size)
+    
+    return merged_df
+
+def calculate_period_statistics(df: pd.DataFrame) -> dict:
+    """
+    Calculate summary statistics for the delta-neutral carry trade performance.
+    
+    Parameters:
+        df: pd.DataFrame with carry trade performance metrics
+            
+    Returns:
+        dict: Dictionary containing summary statistics
+    """
+    # Calculate total returns
+    total_return = df['total_return'].iloc[-1] * 100
+    funding_return = df['funding_return'].iloc[-1] * 100
+    spot_yield_return = df['spot_yield_return'].iloc[-1] * 100
+    
+    # Calculate time period in years
+    days = (df['date'].max() - df['date'].min()).days
+    years = days / 365
+    
+    # Calculate annualized return
+    annualized_return = ((1 + total_return/100) ** (1/years) - 1) * 100 if years > 0 else 0
+    
+    # Calculate daily PnL volatility and annualize it
+    daily_pnl_returns = df['daily_pnl'] / (df['SP_close'].iloc[0] * 1)  # Normalize by initial position value
+    daily_vol = daily_pnl_returns.std()
+    volatility = daily_vol * np.sqrt(252) * 100  # Annualized volatility in percentage
+    
+    # Calculate Sharpe ratio
+    avg_daily_return = daily_pnl_returns.mean() * 252  # Annualized mean daily return
+    sharpe_ratio = avg_daily_return / (daily_vol * np.sqrt(252)) if daily_vol != 0 else 0
+    
+    # Calculate maximum drawdown
+    cumulative_returns = df['total_return']
+    running_max = cumulative_returns.cummax()
+    drawdown = (cumulative_returns - running_max) / (1 + running_max)  # Relative drawdown
+    max_drawdown = drawdown.min() * 100
+    
+    return {
+        'total_return_pct': total_return,
+        'annualized_return_pct': annualized_return,
+        'volatility_pct': volatility,
+        'sharpe_ratio': sharpe_ratio,
+        'max_drawdown_pct': max_drawdown,
+        'funding_return_pct': funding_return,
+        'spot_return_pct': spot_yield_return,
+        'days': days,
+        'start_date': df['date'].min(),
+        'end_date': df['date'].max()
+    }
+
+def plot_carry_trade_performance(merged_df: pd.DataFrame, stats: dict):
+    """
+    Plot the carry trade performance metrics.
+    
+    Parameters:
+        merged_df: pd.DataFrame - DataFrame with carry trade metrics
+        stats: dict - Dictionary with performance statistics
+    """
+    # plt.style.use('seaborn')
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), height_ratios=[2, 1])
+    
+    # Plot cumulative returns
+    ax1.plot(merged_df['date'], merged_df['total_return'] * 100, 
+             label=f'Total Return ({stats["total_return_pct"]:.1f}%)', color='blue')
+    ax1.plot(merged_df['date'], merged_df['funding_return'] * 100, 
+             label=f'Funding Return ({stats["funding_return_pct"]:.1f}%)', color='green', alpha=0.7)
+    if 'spot_yield_return' in merged_df.columns:
+        ax1.plot(merged_df['date'], merged_df['spot_yield_return'] * 100, 
+                label=f'Spot Yield ({stats["spot_return_pct"]:.1f}%)', color='orange', alpha=0.7)
+    
+    ax1.set_title('Delta-Neutral Carry Trade Performance', fontsize=12)
+    ax1.set_xlabel('')
+    ax1.set_ylabel('Cumulative Return (%)')
+    ax1.legend()
+    ax1.grid(True)
+    
+    # Plot funding rates
+    ax2.plot(merged_df['date'], merged_df['FR_close'] * 100, 
+             label='Funding Rate (%)', color='red', alpha=0.7)
+    ax2.set_title('Funding Rates Over Time', fontsize=12)
+    ax2.set_xlabel('Date')
+    ax2.set_ylabel('Funding Rate (%)')
+    ax2.legend()
+    ax2.grid(True)
+    
+    # Add performance metrics as text
+    metrics_text = (
+        f'Annualized Return: {stats["annualized_return_pct"]:.1f}%\n'
+        f'Volatility: {stats["volatility_pct"]:.1f}%\n'
+        f'Sharpe Ratio: {stats["sharpe_ratio"]:.2f}\n'
+        f'Max Drawdown: {stats["max_drawdown_pct"]:.1f}%'
+    )
+    plt.figtext(0.02, 0.02, metrics_text, fontsize=10, 
+                bbox=dict(facecolor='white', alpha=0.8))
+    
+    plt.tight_layout()
+    plt.show()
