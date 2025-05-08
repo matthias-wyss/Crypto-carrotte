@@ -606,7 +606,6 @@ def analyze_venue_switching_strategy(metrics_df: pd.DataFrame) -> pd.DataFrame:
 
 
 #Added by Loris to compute carry trade performance
-
 def merge_and_compute_carry_trade(
     spot_df: pd.DataFrame,
     futures_df: pd.DataFrame,
