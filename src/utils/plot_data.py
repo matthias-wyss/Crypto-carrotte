@@ -4,7 +4,7 @@ import seaborn as sns
 import pandas as pd
 import matplotlib.dates as mdates
 
-def plot_funding_and_price(df, symbol="BTC"):
+def plot_funding_and_price(df, symbol="BTC", funding_rate_col="fundingRate", close_price_col="closePrice"):
     """
     Plots two separate graphs: one for funding rate, one for close price.
     Also saves both plots as images in ../../data/images.
@@ -22,7 +22,7 @@ def plot_funding_and_price(df, symbol="BTC"):
 
     # Plot funding rate
     plt.figure(figsize=(14, 6))
-    plt.plot(df['timestamp'], df['fundingRate'], color='tab:blue', alpha=0.8)
+    plt.plot(df['timestamp'], df[funding_rate_col], color='tab:blue', alpha=0.8)
     plt.title(f'{symbol} - Funding Rate Over Time')
     plt.xlabel('Date')
     plt.ylabel('Funding Rate')
@@ -36,7 +36,7 @@ def plot_funding_and_price(df, symbol="BTC"):
 
     # Plot close price
     plt.figure(figsize=(14, 6))
-    plt.plot(df['timestamp'], df['closePrice'], color='tab:orange')
+    plt.plot(df['timestamp'], df[close_price_col], color='tab:orange')
     plt.title(f'{symbol} - Close Price Over Time')
     plt.xlabel('Date')
     plt.ylabel(f'{symbol} Price (USDT)')
