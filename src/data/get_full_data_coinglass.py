@@ -1,15 +1,16 @@
 import pandas as pd
 import requests
 import time
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 import numpy as np
 from pathlib import Path
 import pandas as pd
 import os
 import glob
 import re
-from typing import Dict, List, Tuple, Optional
 import matplotlib.pyplot as plt
+from scipy import stats
+
 
 
 
@@ -606,6 +607,7 @@ def analyze_venue_switching_strategy(metrics_df: pd.DataFrame) -> pd.DataFrame:
 
 
 #Added by Loris to compute carry trade performance
+
 def merge_and_compute_carry_trade(
     spot_df: pd.DataFrame,
     futures_df: pd.DataFrame,
@@ -614,14 +616,6 @@ def merge_and_compute_carry_trade(
     """
     Merge spot and futures dataframes and compute delta-neutral carry trade performance.
     Strategy: Long spot, Short futures (equal notional amounts)
-    
-    Parameters:
-        spot_df: pd.DataFrame with columns: date, timestamp, SP_open, SP_close, etc.
-        futures_df: pd.DataFrame with columns: date, timestamp, FR_open, FR_close, etc.
-        merge_on: str - Column to merge on ('date' or 'timestamp')
-            
-    Returns:
-        pd.DataFrame: Merged DataFrame with carry trade performance metrics
     """
     # Ensure timestamp is numeric in both dataframes
     if merge_on == 'timestamp':
@@ -652,142 +646,255 @@ def merge_and_compute_carry_trade(
     merged_df['entry_price'] = entry_price
     merged_df['exit_price'] = exit_price
     
-    # Track positions - in delta neutral, we have equal but opposite notional values
-    merged_df['spot_position_value'] = merged_df['SP_close'] * position_size
-    merged_df['perp_position_value'] = -merged_df['SP_close'] * position_size  # Short position
+    # Calculate underlying asset returns and volatility
+    merged_df['daily_spot_return'] = merged_df['SP_close'].pct_change().fillna(0)
     
-    # Calculate daily PnL components:
-    # 1. For a delta-neutral strategy, price movements should net to zero 
-    #    when perfectly balanced (which we're assuming)
+    # Convert funding rates from percentage to decimal
+    merged_df['FR_close_pct'] = merged_df['FR_close'] / 100  # Convert from % to decimal
+    merged_df['FR_annualized'] = merged_df['FR_close'] * 365  # Annualized for display
     
-    # 2. Funding payments - positive funding means we receive when short
-    #    These funding rates are daily percentages (e.g., 0.01 means 1% per day)
-    merged_df['FR_close_pct'] = merged_df['FR_close'] / 100  # Convert to decimal (e.g., 0.01 -> 0.0001)
+    # Calculate strategy returns
     merged_df['funding_pnl'] = merged_df['FR_close_pct'] * initial_investment
+    merged_df['daily_funding_return'] = merged_df['funding_pnl'] / initial_investment
+    merged_df['funding_return'] = (1 + merged_df['daily_funding_return']).cumprod() - 1
     
-    # Calculate returns
-    merged_df['funding_cumulative_pnl'] = merged_df['funding_pnl'].cumsum()
-    merged_df['funding_return'] = merged_df['funding_cumulative_pnl'] / initial_investment
-    
-    # In a perfect delta-neutral strategy, the total return equals the funding return
+    # The strategy total return equals the funding return in a perfect delta-neutral setup
     merged_df['total_return'] = merged_df['funding_return']
     
-    # For display purposes, calculate the isolated returns of each leg
-    merged_df['spot_pct_change'] = merged_df['SP_close'].pct_change().fillna(0)
+    # For reference: track what would happen to spot and perp positions separately
     merged_df['spot_return'] = (merged_df['SP_close'] / entry_price) - 1
-    merged_df['perp_return'] = -merged_df['spot_return']  # Perfectly offsetting in theory
+    merged_df['perp_return'] = -merged_df['spot_return']
+    
+    # Detect market regimes - simple definition based on price trend
+    merged_df['price_sma_20'] = merged_df['SP_close'].rolling(window=20).mean()
+    merged_df['price_sma_50'] = merged_df['SP_close'].rolling(window=50).mean()
+    merged_df['bull_market'] = (merged_df['price_sma_20'] > merged_df['price_sma_50']).astype(int)
+    
+    # Detect market corrections and recoveries
+    high_watermark = merged_df['SP_close'].cummax()
+    merged_df['drawdown_pct'] = (merged_df['SP_close'] - high_watermark) / high_watermark * 100
+    merged_df['in_correction'] = (merged_df['drawdown_pct'] <= -10).astype(int)  # 10% or more drawdown is correction
+    
+    # Track when we exit a correction (start of recovery)
+    merged_df['recovery_start'] = (merged_df['in_correction'].shift(1) == 1) & (merged_df['in_correction'] == 0)
     
     return merged_df
 
-def calculate_period_statistics(df: pd.DataFrame) -> dict:
+def calculate_period_statistics(df: pd.DataFrame) -> Dict[str, Any]:
     """
-    Calculate summary statistics for the delta-neutral carry trade performance.
-    
-    Parameters:
-        df: pd.DataFrame with carry trade performance metrics
-            
-    Returns:
-        dict: Dictionary containing summary statistics
+    Calculate comprehensive statistics for the delta-neutral carry trade and underlying asset.
     """
-    # Calculate total returns
-    total_return = df['total_return'].iloc[-1] * 100
-    funding_return = df['funding_return'].iloc[-1] * 100
-    spot_return = df['spot_return'].iloc[-1] * 100
-    perp_return = df['perp_return'].iloc[-1] * 100
+    # Calculate time period
+    days = (df['date'].max() - df['date'].min()).days
+    years = days / 365
     
     # Get entry and exit prices
     entry_price = df['entry_price'].iloc[0]
     exit_price = df['exit_price'].iloc[-1]
     
-    # Calculate time period in years
-    days = (df['date'].max() - df['date'].min()).days
-    years = days / 365
+    # Underlying Asset Statistics
+    daily_spot_returns = df['daily_spot_return'] 
+    spot_volatility = daily_spot_returns.std() * np.sqrt(252) * 100  # Annualized
+    spot_return = df['spot_return'].iloc[-1] * 100
+    spot_annualized_return = ((1 + spot_return/100) ** (1/years) - 1) * 100 if years > 0 else 0
     
-    # Calculate annualized return
-    annualized_return = ((1 + total_return/100) ** (1/years) - 1) * 100 if years > 0 else 0
+    # Calculate maximum drawdown of underlying
+    high_watermark = df['SP_close'].cummax()
+    drawdown_series = (df['SP_close'] - high_watermark) / high_watermark
+    max_spot_drawdown = drawdown_series.min() * 100
     
-    # Calculate volatility of daily funding returns
-    daily_funding_returns = df['funding_pnl'].diff().fillna(df['funding_pnl'].iloc[0]) / (entry_price * 1)
-    volatility = daily_funding_returns.std() * np.sqrt(252) * 100  # Annualized volatility
+    # Carry Trade Strategy Statistics
+    funding_return = df['funding_return'].iloc[-1] * 100
+    annualized_funding_return = ((1 + funding_return/100) ** (1/years) - 1) * 100 if years > 0 else 0
     
-    # Calculate Sharpe ratio (assuming 0% risk-free rate)
-    avg_daily_funding_return = daily_funding_returns.mean()
-    annualized_mean_return = avg_daily_funding_return * 252
-    sharpe_ratio = annualized_mean_return / (daily_funding_returns.std() * np.sqrt(252)) if daily_funding_returns.std() > 0 else 0
+    # Calculate maximum drawdown of strategy returns
+    strategy_equity_curve = (1 + df['funding_return'])
+    strategy_hwm = strategy_equity_curve.cummax()
+    strategy_drawdown_series = (strategy_equity_curve - strategy_hwm) / strategy_hwm
+    max_strategy_drawdown = strategy_drawdown_series.min() * 100
     
-    # Calculate maximum drawdown
-    cumulative_return_series = 1 + (df['total_return'])
-    peak = cumulative_return_series.cummax()
-    drawdown = (cumulative_return_series - peak) / peak
-    max_drawdown = drawdown.min() * 100 if not drawdown.empty else 0
+    # Funding Rates Statistics
+    avg_daily_funding = df['FR_close'].mean()
+    annualized_funding = avg_daily_funding * 365
+    
+    # Market Regime Analysis
+    bull_days = df['bull_market'].sum()
+    bear_days = len(df) - bull_days
+    bull_market_returns = df[df['bull_market'] == 1]['daily_spot_return'].mean() * 100
+    bear_market_returns = df[df['bull_market'] == 0]['daily_spot_return'].mean() * 100
+    
+    bull_market_funding = df[df['bull_market'] == 1]['FR_close'].mean()
+    bear_market_funding = df[df['bull_market'] == 0]['FR_close'].mean()
+    
+    # Correction and Recovery Analysis
+    correction_days = df['in_correction'].sum()
+    correction_funding_rate = df[df['in_correction'] == 1]['FR_close'].mean()
+    recovery_days = df['recovery_start'].sum()
+    
+    # Correlation between price changes and funding rates
+    price_funding_corr = df['daily_spot_return'].corr(df['FR_close'])
+    
+    # Sharpe Ratio calculation for the strategy (based on funding returns)
+    risk_free_rate = 0.02 / 252  # assuming 2% annual risk-free
+    daily_excess_returns = df['daily_funding_return'] - risk_free_rate
+    sharpe_ratio = (daily_excess_returns.mean() / daily_excess_returns.std()) * np.sqrt(252) if daily_excess_returns.std() > 0 else 0
     
     return {
-        'total_return_pct': total_return,
-        'annualized_return_pct': annualized_return,
-        'volatility_pct': volatility,
-        'sharpe_ratio': sharpe_ratio,
-        'max_drawdown_pct': max_drawdown,
-        'funding_return_pct': funding_return,
-        'spot_return_pct': spot_return,
-        'perp_return_pct': perp_return,
+        # Period info
+        'days': days,
+        'years': years,
+        'start_date': df['date'].min(),
+        'end_date': df['date'].max(),
+        
+        # Price info
         'entry_price': entry_price,
         'exit_price': exit_price,
-        'days': days,
-        'start_date': df['date'].min(),
-        'end_date': df['date'].max()
+        
+        # Underlying asset stats
+        'spot_return_pct': spot_return,
+        'spot_annualized_return_pct': spot_annualized_return,
+        'spot_volatility_pct': spot_volatility,
+        'max_spot_drawdown_pct': max_spot_drawdown,
+        
+        # Strategy stats
+        'funding_return_pct': funding_return,
+        'annualized_funding_return_pct': annualized_funding_return,
+        'sharpe_ratio': sharpe_ratio,
+        'max_strategy_drawdown_pct': max_strategy_drawdown,
+        
+        # Funding rates
+        'avg_daily_funding_pct': avg_daily_funding,
+        'annualized_funding_pct': annualized_funding,
+        
+        # Market regime analysis
+        'bull_market_days': bull_days,
+        'bull_market_pct': (bull_days / len(df)) * 100,
+        'bear_market_days': bear_days,
+        'bull_market_daily_return': bull_market_returns,
+        'bear_market_daily_return': bear_market_returns,
+        'bull_market_funding_rate': bull_market_funding,
+        'bear_market_funding_rate': bear_market_funding,
+        'annualized_bull_funding': bull_market_funding * 365,
+        'annualized_bear_funding': bear_market_funding * 365,
+        
+        # Correction analysis
+        'correction_days': correction_days,
+        'correction_funding_rate': correction_funding_rate,
+        'price_funding_correlation': price_funding_corr,
     }
 
-def plot_carry_trade_performance(merged_df: pd.DataFrame, stats: dict):
+def plot_carry_trade_performance(merged_df: pd.DataFrame, stats: dict, title: str = None):
     """
-    Plot the carry trade performance metrics.
+    Plot comprehensive performance of the delta-neutral carry trade and underlying asset.
     """
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), height_ratios=[2, 1])
+    fig = plt.figure(figsize=(16, 12))
+    spec = fig.add_gridspec(3, 2)
     
-    # Plot cumulative returns
-    ax1.plot(merged_df['date'], merged_df['total_return'] * 100, 
-             label=f'Total Return ({stats["total_return_pct"]:.2f}%)', color='blue', linewidth=2)
-    ax1.plot(merged_df['date'], merged_df['funding_return'] * 100, 
-             label=f'Funding Return ({stats["funding_return_pct"]:.2f}%)', color='green', alpha=0.7)
+    # Plot 1: Asset price and market regimes
+    ax1 = fig.add_subplot(spec[0, :])
+    ax1.plot(merged_df['date'], merged_df['SP_close'], label='Asset Price', color='blue')
     
-    # Plot spot and perp returns (for illustrative purposes - they should offset in theory)
-    ax1.plot(merged_df['date'], merged_df['spot_return'] * 100, 
-             label=f'Spot Return ({stats["spot_return_pct"]:.2f}%)', color='orange', linestyle='--', alpha=0.5)
-    ax1.plot(merged_df['date'], merged_df['perp_return'] * 100, 
-             label=f'Perp Return ({stats["perp_return_pct"]:.2f}%)', color='red', linestyle='--', alpha=0.5)
+    # Highlight bull markets
+    bull_regions = []
+    current_start = None
+    for idx, row in merged_df.iterrows():
+        if row['bull_market'] == 1 and current_start is None:
+            current_start = row['date']
+        elif row['bull_market'] == 0 and current_start is not None:
+            bull_regions.append((current_start, row['date']))
+            current_start = None
     
-    ax1.set_title('Delta-Neutral Carry Trade Performance', fontsize=12)
-    ax1.set_xlabel('')
-    ax1.set_ylabel('Cumulative Return (%)')
-    ax1.legend()
+    if current_start is not None:  # Handle case where we end in bull market
+        bull_regions.append((current_start, merged_df['date'].iloc[-1]))
+        
+    for start, end in bull_regions:
+        ax1.axvspan(start, end, alpha=0.2, color='green')
+        
+    # Highlight corrections
+    correction_regions = []
+    current_start = None
+    for idx, row in merged_df.iterrows():
+        if row['in_correction'] == 1 and current_start is None:
+            current_start = row['date']
+        elif row['in_correction'] == 0 and current_start is not None:
+            correction_regions.append((current_start, row['date']))
+            current_start = None
+    
+    if current_start is not None:  # Handle case where we end in a correction
+        correction_regions.append((current_start, merged_df['date'].iloc[-1]))
+        
+    for start, end in correction_regions:
+        ax1.axvspan(start, end, alpha=0.2, color='red')
+        
+    ax1.set_title('Asset Price with Market Regimes' if title is None else f'{title} Price with Market Regimes', fontsize=14)
+    ax1.set_ylabel('Price ($)')
+    ax1.legend(['Asset Price', 'Bull Market', 'Market Correction'])
     ax1.grid(True)
     
-    # Plot funding rates - display as percentages
-    ax2.plot(merged_df['date'], merged_df['FR_close'], 
-             label='Daily Funding Rate (%)', color='red')
-    ax2.set_title('Daily Funding Rates Over Time (%)', fontsize=12)
-    ax2.set_xlabel('Date')
-    ax2.set_ylabel('Daily Funding Rate (%)')
+    # Plot 2: Funding rates (annualized)
+    ax2 = fig.add_subplot(spec[1, 0])
+    ax2.plot(merged_df['date'], merged_df['FR_annualized'], color='purple')
+    ax2.set_title('Annualized Funding Rates', fontsize=12)
+    ax2.set_ylabel('Annual Rate (%)')
+    ax2.axhline(y=stats['annualized_funding_pct'], color='r', linestyle='--', 
+                label=f'Avg: {stats["annualized_funding_pct"]:.2f}%')
+    ax2.axhline(y=stats['annualized_bull_funding'], color='g', linestyle='--', 
+                label=f'Bull Avg: {stats["annualized_bull_funding"]:.2f}%')
+    ax2.axhline(y=stats['annualized_bear_funding'], color='orange', linestyle='--', 
+                label=f'Bear Avg: {stats["annualized_bear_funding"]:.2f}%')
     ax2.legend()
     ax2.grid(True)
     
-    # Add performance metrics as text
-    metrics_text = (
-        f'Annualized Return: {stats["annualized_return_pct"]:.2f}%\n'
-        f'Volatility: {stats["volatility_pct"]:.2f}%\n'
-        f'Sharpe Ratio: {stats["sharpe_ratio"]:.2f}\n'
-        f'Max Drawdown: {stats["max_drawdown_pct"]:.2f}%\n'
-        f'Funding Return: {stats["funding_return_pct"]:.2f}%\n'
-        f'Spot Return: {stats["spot_return_pct"]:.2f}%\n'
-        f'Perp Return: {stats["perp_return_pct"]:.2f}%\n'
-        f'Entry Price: ${stats["entry_price"]:.2f}\n'
-        f'Exit Price: ${stats["exit_price"]:.2f}\n'
-        f'Period: {stats["start_date"].strftime("%Y-%m-%d")} to {stats["end_date"].strftime("%Y-%m-%d")} ({stats["days"]} days)'
-    )
-    plt.figtext(0.02, 0.02, metrics_text, fontsize=10, 
-                bbox=dict(facecolor='white', alpha=0.8))
+    # Plot 3: Cumulative funding return
+    ax3 = fig.add_subplot(spec[1, 1])
+    ax3.plot(merged_df['date'], merged_df['funding_return'] * 100, color='green')
+    ax3.set_title('Cumulative Funding Return', fontsize=12)
+    ax3.set_ylabel('Return (%)')
+    ax3.grid(True)
+    
+    # Plot 4: Price drawdowns
+    ax4 = fig.add_subplot(spec[2, 0])
+    ax4.fill_between(merged_df['date'], merged_df['drawdown_pct'], 0, color='red', alpha=0.3)
+    ax4.set_title('Underlying Asset Drawdown', fontsize=12)
+    ax4.set_ylabel('Drawdown (%)')
+    ax4.set_ylim(1.1 * merged_df['drawdown_pct'].min(), 5)  # Give some padding below min drawdown
+    ax4.grid(True)
+    
+    # Plot 5: Strategy drawdowns (based on funding returns)
+    ax5 = fig.add_subplot(spec[2, 1])
+    strategy_equity = (1 + merged_df['funding_return'])
+    strategy_hwm = strategy_equity.cummax()
+    strategy_dd = (strategy_equity - strategy_hwm) / strategy_hwm * 100
+    ax5.fill_between(merged_df['date'], strategy_dd, 0, color='orange', alpha=0.3)
+    ax5.set_title('Strategy Drawdown', fontsize=12)
+    ax5.set_ylabel('Drawdown (%)')
+    ax5.grid(True)
     
     plt.tight_layout()
+    
+    # Add summary stats as text
+    summary_text = (
+        f"Period: {stats['start_date'].strftime('%Y-%m-%d')} to {stats['end_date'].strftime('%Y-%m-%d')} ({stats['days']} days)\n\n"
+        f"== Underlying Statistics ==\n"
+        f"Total Return: {stats['spot_return_pct']:.2f}%\n"
+        f"Annualized: {stats['spot_annualized_return_pct']:.2f}%\n"
+        f"Volatility: {stats['spot_volatility_pct']:.2f}%\n"
+        f"Max Drawdown: {stats['max_spot_drawdown_pct']:.2f}%\n\n"
+        f"== Strategy Statistics ==\n"
+        f"Funding Return: {stats['funding_return_pct']:.2f}%\n"
+        f"Annualized: {stats['annualized_funding_return_pct']:.2f}%\n"
+        f"Sharpe Ratio: {stats['sharpe_ratio']:.2f}\n"
+        f"Max Drawdown: {stats['max_strategy_drawdown_pct']:.2f}%\n\n"
+        f"== Market Regimes ==\n"
+        f"Bull Market: {stats['bull_market_pct']:.1f}% of days\n"
+        f"Bull Funding: {stats['annualized_bull_funding']:.2f}% p.a.\n"
+        f"Bear Funding: {stats['annualized_bear_funding']:.2f}% p.a.\n"
+        f"Price/Funding Corr: {stats['price_funding_correlation']:.2f}"
+    )
+    plt.figtext(0.01, 0.01, summary_text, fontsize=10, bbox=dict(facecolor='white', alpha=0.8))
+    
     plt.show()
+
 
 def separate_crypto_data(df, output_folder='src/data/concat'):
     """
