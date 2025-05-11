@@ -644,8 +644,13 @@ def merge_and_compute_carry_trade(
     
     # Initial settings
     position_size = 1.0
-    initial_price = merged_df['SP_close'].iloc[0]
-    initial_investment = initial_price * position_size
+    entry_price = merged_df['SP_close'].iloc[0]
+    exit_price = merged_df['SP_close'].iloc[-1]
+    initial_investment = entry_price * position_size
+    
+    # Store entry and exit prices
+    merged_df['entry_price'] = entry_price
+    merged_df['exit_price'] = exit_price
     
     # Track positions - in delta neutral, we have equal but opposite notional values
     merged_df['spot_position_value'] = merged_df['SP_close'] * position_size
@@ -667,15 +672,12 @@ def merge_and_compute_carry_trade(
     # In a perfect delta-neutral strategy, the total return equals the funding return
     merged_df['total_return'] = merged_df['funding_return']
     
-    # For display purposes, also calculate the isolated returns of each leg
-    # (these should offset each other but are useful for visualization)
+    # For display purposes, calculate the isolated returns of each leg
     merged_df['spot_pct_change'] = merged_df['SP_close'].pct_change().fillna(0)
-    merged_df['spot_return'] = (merged_df['SP_close'] / initial_price) - 1
-    merged_df['perp_return'] = -merged_df['spot_return']  # Perfectly offsetting
+    merged_df['spot_return'] = (merged_df['SP_close'] / entry_price) - 1
+    merged_df['perp_return'] = -merged_df['spot_return']  # Perfectly offsetting in theory
     
     return merged_df
-
-
 
 def calculate_period_statistics(df: pd.DataFrame) -> dict:
     """
@@ -693,6 +695,10 @@ def calculate_period_statistics(df: pd.DataFrame) -> dict:
     spot_return = df['spot_return'].iloc[-1] * 100
     perp_return = df['perp_return'].iloc[-1] * 100
     
+    # Get entry and exit prices
+    entry_price = df['entry_price'].iloc[0]
+    exit_price = df['exit_price'].iloc[-1]
+    
     # Calculate time period in years
     days = (df['date'].max() - df['date'].min()).days
     years = days / 365
@@ -701,7 +707,7 @@ def calculate_period_statistics(df: pd.DataFrame) -> dict:
     annualized_return = ((1 + total_return/100) ** (1/years) - 1) * 100 if years > 0 else 0
     
     # Calculate volatility of daily funding returns
-    daily_funding_returns = df['funding_pnl'].diff().fillna(df['funding_pnl'].iloc[0]) / (df['SP_close'].iloc[0] * 1)
+    daily_funding_returns = df['funding_pnl'].diff().fillna(df['funding_pnl'].iloc[0]) / (entry_price * 1)
     volatility = daily_funding_returns.std() * np.sqrt(252) * 100  # Annualized volatility
     
     # Calculate Sharpe ratio (assuming 0% risk-free rate)
@@ -724,6 +730,8 @@ def calculate_period_statistics(df: pd.DataFrame) -> dict:
         'funding_return_pct': funding_return,
         'spot_return_pct': spot_return,
         'perp_return_pct': perp_return,
+        'entry_price': entry_price,
+        'exit_price': exit_price,
         'days': days,
         'start_date': df['date'].min(),
         'end_date': df['date'].max()
@@ -741,7 +749,7 @@ def plot_carry_trade_performance(merged_df: pd.DataFrame, stats: dict):
     ax1.plot(merged_df['date'], merged_df['funding_return'] * 100, 
              label=f'Funding Return ({stats["funding_return_pct"]:.2f}%)', color='green', alpha=0.7)
     
-    # Plot spot and perp returns (for illustrative purposes - they should offset)
+    # Plot spot and perp returns (for illustrative purposes - they should offset in theory)
     ax1.plot(merged_df['date'], merged_df['spot_return'] * 100, 
              label=f'Spot Return ({stats["spot_return_pct"]:.2f}%)', color='orange', linestyle='--', alpha=0.5)
     ax1.plot(merged_df['date'], merged_df['perp_return'] * 100, 
@@ -753,7 +761,7 @@ def plot_carry_trade_performance(merged_df: pd.DataFrame, stats: dict):
     ax1.legend()
     ax1.grid(True)
     
-    # Plot funding rates - display as DAILY percentages
+    # Plot funding rates - display as percentages
     ax2.plot(merged_df['date'], merged_df['FR_close'], 
              label='Daily Funding Rate (%)', color='red')
     ax2.set_title('Daily Funding Rates Over Time (%)', fontsize=12)
@@ -768,6 +776,11 @@ def plot_carry_trade_performance(merged_df: pd.DataFrame, stats: dict):
         f'Volatility: {stats["volatility_pct"]:.2f}%\n'
         f'Sharpe Ratio: {stats["sharpe_ratio"]:.2f}\n'
         f'Max Drawdown: {stats["max_drawdown_pct"]:.2f}%\n'
+        f'Funding Return: {stats["funding_return_pct"]:.2f}%\n'
+        f'Spot Return: {stats["spot_return_pct"]:.2f}%\n'
+        f'Perp Return: {stats["perp_return_pct"]:.2f}%\n'
+        f'Entry Price: ${stats["entry_price"]:.2f}\n'
+        f'Exit Price: ${stats["exit_price"]:.2f}\n'
         f'Period: {stats["start_date"].strftime("%Y-%m-%d")} to {stats["end_date"].strftime("%Y-%m-%d")} ({stats["days"]} days)'
     )
     plt.figtext(0.02, 0.02, metrics_text, fontsize=10, 
@@ -775,3 +788,99 @@ def plot_carry_trade_performance(merged_df: pd.DataFrame, stats: dict):
     
     plt.tight_layout()
     plt.show()
+
+def separate_crypto_data(df, output_folder='src/data/concat'):
+    """
+    Separates mixed crypto data into separate BTC and ETH dataframes based on symbol column.
+    
+    Parameters:
+        df: pandas DataFrame containing mixed BTC and ETH data
+        output_folder: Root folder to save the separated data
+        
+    Returns:
+        tuple: (btc_df, eth_df) - The separated dataframes
+    """
+    # Check which symbol column is present
+    symbol_column = None
+    if 'spot_symbol' in df.columns:
+        symbol_column = 'spot_symbol'
+    elif 'perp_symbol' in df.columns:
+        symbol_column = 'perp_symbol'
+    else:
+        raise ValueError("No symbol column (spot_symbol or perp_symbol) found in dataframe")
+    
+    # Create a mask to identify ETH data
+    eth_mask = df[symbol_column].str.contains('ETH', case=False)
+    
+    # Create a mask to identify BTC data - including XBT variations
+    btc_mask = (df[symbol_column].str.contains('BTC', case=False) | 
+                df[symbol_column].str.contains('XBT', case=False))
+    
+    # Extract ETH and BTC data
+    eth_df = df[eth_mask].copy()
+    btc_df = df[btc_mask].copy()
+    
+    # Create output directories if they don't exist
+    os.makedirs(f"{output_folder}/BTC", exist_ok=True)
+    os.makedirs(f"{output_folder}/ETH", exist_ok=True)
+    
+    # Generate filenames based on the type of data
+    name_suffix = ''
+    if 'SP_close' in df.columns:
+        name_suffix = 'spot_data'
+    elif 'FR_close' in df.columns:
+        name_suffix = 'futures_data'
+    else:
+        name_suffix = 'data'
+    
+    # Get date range for filename
+    start_date = df['date'].min().split(' ')[0] if isinstance(df['date'].iloc[0], str) else df['date'].min().strftime('%Y-%m-%d')
+    end_date = df['date'].max().split(' ')[0] if isinstance(df['date'].iloc[0], str) else df['date'].max().strftime('%Y-%m-%d')
+    
+    # Save the separated dataframes
+    btc_filename = f"{output_folder}/BTC/btc_{name_suffix}_{start_date}_to_{end_date}.csv"
+    eth_filename = f"{output_folder}/ETH/eth_{name_suffix}_{start_date}_to_{end_date}.csv"
+    
+    btc_df.to_csv(btc_filename, index=False)
+    eth_df.to_csv(eth_filename, index=False)
+    
+    print(f"BTC data saved to {btc_filename}")
+    print(f"ETH data saved to {eth_filename}")
+    
+    # Return the separate dataframes
+    return btc_df, eth_df
+
+def process_data_files(spot_file_path, futures_file_path):
+    """
+    Process spot and futures data files, separating them into BTC and ETH datasets
+    
+    Parameters:
+        spot_file_path: Path to the spot data CSV file
+        futures_file_path: Path to the futures data CSV file
+    """
+    # Read the data
+    spot_df = pd.read_csv(spot_file_path)
+    futures_df = pd.read_csv(futures_file_path)
+    
+    # Convert date to datetime if not already
+    if not pd.api.types.is_datetime64_dtype(spot_df['date']):
+        spot_df['date'] = pd.to_datetime(spot_df['date'])
+    if not pd.api.types.is_datetime64_dtype(futures_df['date']):
+        futures_df['date'] = pd.to_datetime(futures_df['date'])
+    
+    # Separate the spot and futures data
+    print("Separating spot data...")
+    btc_spot_df, eth_spot_df = separate_crypto_data(spot_df)
+    
+    print("\nSeparating futures data...")
+    btc_futures_df, eth_futures_df = separate_crypto_data(futures_df)
+    
+    print("\nData separation complete!")
+    
+    # Return all the dataframes
+    return {
+        'btc_spot': btc_spot_df,
+        'eth_spot': eth_spot_df,
+        'btc_futures': btc_futures_df,
+        'eth_futures': eth_futures_df
+    }
