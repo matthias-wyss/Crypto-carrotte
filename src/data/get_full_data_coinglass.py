@@ -565,44 +565,477 @@ def calculate_max_drawdown(returns: pd.Series) -> float:
     drawdown = (returns - cumulative) / cumulative
     return drawdown.min() * 100 if not drawdown.empty else 0
 
-def analyze_venue_switching_strategy(metrics_df: pd.DataFrame) -> pd.DataFrame:
+def analyze_venue_switching_strategy(
+    spot_df: pd.DataFrame,
+    futures_dfs: Dict[str, pd.DataFrame], 
+    window_size: int = 7,
+    maker_fee: float = 0.0,
+    taker_fee: float = 0.0,
+    use_maker_fee: bool = True,
+    position_size: float = 1.0,
+    verbose: bool = False
+) -> Dict[str, Any]:
     """
-    Analyze if switching venues for the short futures position would be beneficial
+    Analyzes a dynamic strategy that switches the short futures position between exchanges
+    to optimize funding returns, accounting for trading fees.
     
     Parameters:
-        metrics_df: DataFrame - Performance metrics by exchange pair
-        
+        spot_df: DataFrame - Spot price data for the base asset
+        futures_dfs: Dict[str, DataFrame] - Dictionary mapping exchange names to their futures data
+        window_size: int - Number of periods to use for making venue decisions
+        maker_fee: float - Maker fee as a percentage (e.g., 0.02 for 0.02%)
+        taker_fee: float - Taker fee as a percentage (e.g., 0.05 for 0.05%)
+        use_maker_fee: bool - Whether to use maker fee (True) or taker fee (False) for venue switching
+        position_size: float - Size of the position (multiplier for returns and fees)
+        verbose: bool - Whether to print detailed logs during execution
+    
     Returns:
-        DataFrame with analysis results
+        Dictionary containing performance metrics, exchange switching details, and comparison results
     """
-    if metrics_df.empty:
-        return pd.DataFrame()
+    if len(futures_dfs) < 2:
+        raise ValueError("Need at least two exchanges to analyze venue switching")
+
+    # Standardize timestamps and ensure all dataframes use the same date format
+    spot_df = spot_df.sort_values('timestamp').copy()
+    spot_df['date'] = pd.to_datetime(spot_df['date'])
+    exchange_dfs = {}
     
-    # Group by spot exchange and find best perpetual exchange for each period
-    spot_exchanges = metrics_df['spot_exchange'].unique()
+    # Initial setup for each exchange
+    for exchange, df in futures_dfs.items():
+        df = df.sort_values('timestamp').copy()
+        df['date'] = pd.to_datetime(df['date'])
+        
+        # Merge with spot data to ensure we have the same timestamps
+        merged = pd.merge(spot_df, df, on='timestamp', how='inner', suffixes=('', f'_{exchange}'))
+        
+        # Keep only the necessary columns for this exchange
+        cols_to_keep = ['date', 'timestamp', 'SP_close', f'FR_close_{exchange}', f'perp_exchange_{exchange}']
+        merged = merged[cols_to_keep]
+        
+        # Rename the FR_close column for clarity
+        merged = merged.rename(columns={f'FR_close_{exchange}': 'FR_close'})
+        
+        exchange_dfs[exchange] = merged
     
-    results = []
-    for spot_ex in spot_exchanges:
-        spot_data = metrics_df[metrics_df['spot_exchange'] == spot_ex]
-        
-        # Find best perpetual exchange based on Sharpe ratio
-        best_perp = spot_data.loc[spot_data['sharpe_ratio'].idxmax()]
-        
-        # Compare with average performance
-        avg_performance = spot_data.mean()
-        
-        results.append({
-            'spot_exchange': spot_ex,
-            'best_perp_exchange': best_perp['perp_exchange'],
-            'best_perp_sharpe': best_perp['sharpe_ratio'],
-            'avg_perp_sharpe': avg_performance['sharpe_ratio'],
-            'sharpe_improvement': best_perp['sharpe_ratio'] - avg_performance['sharpe_ratio'],
-            'best_perp_return': best_perp['annualized_return_pct'],
-            'avg_perp_return': avg_performance['annualized_return_pct'],
-            'return_improvement': best_perp['annualized_return_pct'] - avg_performance['annualized_return_pct']
-        })
+    # Find common timestamps across all exchanges and spot
+    common_timestamps = set(spot_df['timestamp'])
+    for df in exchange_dfs.values():
+        common_timestamps = common_timestamps.intersection(set(df['timestamp']))
     
-    return pd.DataFrame(results)
+    common_timestamps = sorted(list(common_timestamps))
+    if len(common_timestamps) < window_size * 2:
+        raise ValueError(f"Not enough common data points across exchanges (need at least {window_size*2})")
+    
+    # Prepare results dataframe
+    results = pd.DataFrame({'timestamp': common_timestamps})
+    results = results.sort_values('timestamp').reset_index(drop=True)
+    
+    # Add date column
+    for exchange, df in exchange_dfs.items():
+        date_map = dict(zip(df['timestamp'], df['date']))
+        results['date'] = results['timestamp'].map(date_map)
+        break  # We only need to do this once
+    
+    # Add spot price
+    for exchange, df in exchange_dfs.items():
+        price_map = dict(zip(df['timestamp'], df['SP_close']))
+        results['SP_close'] = results['timestamp'].map(price_map)
+        break  # All exchanges should have the same spot price
+    
+    # Add funding rates for each exchange
+    for exchange, df in exchange_dfs.items():
+        funding_map = dict(zip(df['timestamp'], df['FR_close']))
+        results[f'FR_{exchange}'] = results['timestamp'].map(funding_map)
+    
+    # Initialize columns for strategy
+    results['best_exchange'] = ''
+    results['switched_exchange'] = False
+    results['fee_paid'] = 0.0
+    results['current_exchange'] = list(exchange_dfs.keys())[0]  # Start with first exchange
+    
+    # Calculate funding return for a static strategy on each exchange
+    for exchange in exchange_dfs:
+        results[f'static_funding_{exchange}'] = results[f'FR_{exchange}'] / 100
+        results[f'static_cumulative_{exchange}'] = (1 + results[f'static_funding_{exchange}']).cumprod() - 1
+    
+    # Initialize strategy metrics
+    results['dynamic_funding'] = 0.0
+    results['dynamic_funding_gross'] = 0.0
+    results['dynamic_funding_fee'] = 0.0
+    results['dynamic_cumulative'] = 0.0
+    initial_price = results['SP_close'].iloc[0]
+    
+    # Calculate which fee to use
+    fee = maker_fee if use_maker_fee else taker_fee
+    
+    # Implement the dynamic venue switching strategy
+    for i in range(len(results)):
+        if i < window_size:
+            # Use the first exchange for initial periods
+            current_exchange = results['current_exchange'].iloc[i - 1] if i > 0 else list(exchange_dfs.keys())[0]
+            results.loc[i, 'best_exchange'] = current_exchange
+            results.loc[i, 'current_exchange'] = current_exchange
+            results.loc[i, 'dynamic_funding'] = results.loc[i, f'FR_{current_exchange}'] / 100
+            results.loc[i, 'dynamic_funding_gross'] = results.loc[i, f'FR_{current_exchange}'] / 100
+        else:
+            current_exchange = results['current_exchange'].iloc[i - 1]
+            
+            # Calculate the average funding rate for each exchange over the past window_size periods
+            avg_funding = {}
+            for exchange in exchange_dfs:
+                avg_funding[exchange] = results.loc[i-window_size:i-1, f'FR_{exchange}'].mean()
+            
+            # Find exchange with the highest average funding rate
+            best_exchange = max(avg_funding, key=avg_funding.get)
+            results.loc[i, 'best_exchange'] = best_exchange
+            
+            # Determine if we should switch exchanges based on fees
+            should_switch = False
+            
+            if best_exchange != current_exchange:
+                # Calculate the expected funding advantage
+                funding_advantage = avg_funding[best_exchange] - avg_funding[current_exchange]
+                
+                # Calculate the cost of switching as a percentage of position value
+                switch_cost_pct = fee * 2  # Fee to close position on current exchange + open on new exchange
+                
+                # Convert cost to same units as funding rate (daily percentage)
+                daily_switch_cost = switch_cost_pct  # Already as a percentage
+                
+                # Switching is profitable if the advantage over the window exceeds the cost
+                if funding_advantage > daily_switch_cost * window_size:
+                    should_switch = True
+                    
+            if should_switch:
+                results.loc[i, 'current_exchange'] = best_exchange
+                results.loc[i, 'switched_exchange'] = True
+                
+                # Calculate fee paid as percentage of position
+                fee_paid = fee * 2 * position_size * (results.loc[i, 'SP_close'] / initial_price)
+                results.loc[i, 'fee_paid'] = fee_paid
+                
+                # Calculate net funding return (gross - fees)
+                results.loc[i, 'dynamic_funding_gross'] = results.loc[i, f'FR_{best_exchange}'] / 100
+                results.loc[i, 'dynamic_funding_fee'] = fee_paid / position_size
+                results.loc[i, 'dynamic_funding'] = results.loc[i, 'dynamic_funding_gross'] - results.loc[i, 'dynamic_funding_fee']
+            else:
+                results.loc[i, 'current_exchange'] = current_exchange
+                results.loc[i, 'dynamic_funding_gross'] = results.loc[i, f'FR_{current_exchange}'] / 100
+                results.loc[i, 'dynamic_funding'] = results.loc[i, 'dynamic_funding_gross']
+    
+    # Calculate cumulative returns for dynamic strategy
+    results['dynamic_cumulative'] = (1 + results['dynamic_funding']).cumprod() - 1
+    
+    # Calculate total trading fees paid
+    total_fees = results['fee_paid'].sum()
+    
+    # Calculate strategy stats for comparison
+    strategy_stats = {}
+    
+    # Dynamic strategy stats
+    dynamic_return = results['dynamic_cumulative'].iloc[-1] * 100
+    dynamic_gross_return = ((1 + results['dynamic_funding_gross']).cumprod() - 1).iloc[-1] * 100
+    days = (results['date'].max() - results['date'].min()).days
+    years = days / 365
+    dynamic_annual_return = ((1 + dynamic_return/100) ** (1/years) - 1) * 100 if years > 0 else 0
+    dynamic_volatility = results['dynamic_funding'].std() * np.sqrt(252) * 100
+    dynamic_sharpe = dynamic_annual_return / dynamic_volatility if dynamic_volatility > 0 else 0
+    
+    strategy_stats['dynamic'] = {
+        'total_return_pct': dynamic_return,
+        'gross_return_pct': dynamic_gross_return, 
+        'total_fees_pct': (total_fees / position_size) * 100,
+        'annualized_return_pct': dynamic_annual_return,
+        'volatility_pct': dynamic_volatility,
+        'sharpe_ratio': dynamic_sharpe,
+        'num_switches': results['switched_exchange'].sum(),
+        'avg_holding_days': days / (results['switched_exchange'].sum() + 1) if results['switched_exchange'].sum() > 0 else days
+    }
+    
+    # Static strategy stats for each exchange
+    for exchange in exchange_dfs:
+        static_return = results[f'static_cumulative_{exchange}'].iloc[-1] * 100
+        static_annual_return = ((1 + static_return/100) ** (1/years) - 1) * 100 if years > 0 else 0
+        static_volatility = results[f'static_funding_{exchange}'].std() * np.sqrt(252) * 100
+        static_sharpe = static_annual_return / static_volatility if static_volatility > 0 else 0
+        
+        strategy_stats[f'static_{exchange}'] = {
+            'total_return_pct': static_return,
+            'annualized_return_pct': static_annual_return,
+            'volatility_pct': static_volatility,
+            'sharpe_ratio': static_sharpe,
+            'total_fees_pct': 0.0,  # No switching fees in static strategy
+            'num_switches': 0
+        }
+    
+    # Find the best static strategy
+    best_static_exchange = max(
+        [ex for ex in exchange_dfs.keys()], 
+        key=lambda ex: strategy_stats[f'static_{ex}']['total_return_pct']
+    )
+    best_static = strategy_stats[f'static_{best_static_exchange}']
+    
+    # Calculate improvement over best static strategy
+    improvement_pct = dynamic_return - best_static['total_return_pct']
+    improvement_annual_pct = dynamic_annual_return - best_static['annualized_return_pct']
+    
+    # Analyze the venues used
+    venue_usage = results['current_exchange'].value_counts().to_dict()
+    venue_usage_pct = {k: (v / len(results) * 100) for k, v in venue_usage.items()}
+    
+    # Calculate average funding rate by exchange
+    avg_funding_by_exchange = {}
+    for exchange in exchange_dfs:
+        avg_funding_by_exchange[exchange] = results[f'FR_{exchange}'].mean()
+    
+    # Analyze when switches happened
+    if results['switched_exchange'].sum() > 0:
+        switch_periods = results[results['switched_exchange']]
+        switch_funding_diff = []
+        
+        for i, row in switch_periods.iterrows():
+            old_exchange = results.loc[i-1, 'current_exchange']
+            new_exchange = row['current_exchange']
+            funding_diff = row[f'FR_{new_exchange}'] - row[f'FR_{old_exchange}']
+            switch_funding_diff.append(funding_diff)
+            
+        avg_funding_improvement = np.mean(switch_funding_diff) if switch_funding_diff else 0
+    else:
+        avg_funding_improvement = 0
+    
+    # Create result dictionary
+    result = {
+        'results_df': results,
+        'strategy_stats': strategy_stats,
+        'dynamic_vs_best_static': {
+            'improvement_pct': improvement_pct,
+            'improvement_annual_pct': improvement_annual_pct,
+            'best_static_exchange': best_static_exchange
+        },
+        'venue_usage': venue_usage,
+        'venue_usage_pct': venue_usage_pct,
+        'avg_funding_by_exchange': avg_funding_by_exchange,
+        'avg_funding_improvement_on_switch': avg_funding_improvement,
+        'total_days': days,
+        'years': years,
+        'fee_settings': {
+            'maker_fee': maker_fee,
+            'taker_fee': taker_fee,
+            'fee_used': fee,
+            'use_maker_fee': use_maker_fee
+        }
+    }
+    
+    return result
+
+def plot_venue_switching_results(result: Dict[str, Any], title: str = None):
+    """
+    Plot the results of the venue switching analysis
+    
+    Parameters:
+        result: Dict - Result from analyze_venue_switching_strategy
+        title: str - Optional title for the plots
+    """
+    results = result['results_df']
+    stats = result['strategy_stats']
+    
+    fig = plt.figure(figsize=(16, 12))
+    spec = fig.add_gridspec(3, 2)
+    
+    # Plot 1: Asset price
+    ax1 = fig.add_subplot(spec[0, :])
+    ax1.plot(results['date'], results['SP_close'], label='Asset Price', color='blue')
+    
+    # Highlight exchange switches
+    switch_dates = results.loc[results['switched_exchange'], 'date']
+    for switch_date in switch_dates:
+        ax1.axvline(x=switch_date, color='gray', linestyle='--', alpha=0.5)
+    
+    # Add colored regions for current exchange
+    current_exchange = results['current_exchange'].iloc[0]
+    start_date = results['date'].iloc[0]
+    exchange_colors = {
+        exchange: plt.cm.tab10(i % 10) 
+        for i, exchange in enumerate(result['venue_usage'].keys())
+    }
+    
+    for i in range(1, len(results)):
+        if results['current_exchange'].iloc[i] != current_exchange:
+            end_date = results['date'].iloc[i]
+            ax1.axvspan(start_date, end_date, alpha=0.2, color=exchange_colors[current_exchange])
+            
+            # Update for next segment
+            current_exchange = results['current_exchange'].iloc[i]
+            start_date = end_date
+    
+    # Add the last segment
+    ax1.axvspan(start_date, results['date'].iloc[-1], alpha=0.2, color=exchange_colors[current_exchange])
+    
+    ax1.set_title('Asset Price and Exchange Switching' if title is None else f'{title} - Venue Switching Analysis', fontsize=14)
+    ax1.set_ylabel('Price ($)')
+    
+    # Create legend for exchanges
+    legend_handles = [plt.Rectangle((0,0),1,1, color=color, alpha=0.5) for color in exchange_colors.values()]
+    legend_labels = list(exchange_colors.keys())
+    ax1.legend(legend_handles, legend_labels, title="Active Exchange")
+    ax1.grid(True)
+    
+    # Plot 2: Funding rates by exchange
+    ax2 = fig.add_subplot(spec[1, 0])
+    for exchange in result['avg_funding_by_exchange'].keys():
+        ax2.plot(results['date'], results[f'FR_{exchange}'], label=exchange)
+        
+    # Add markers for switch events
+    for i, row in results[results['switched_exchange']].iterrows():
+        ax2.plot(row['date'], row[f'FR_{row["current_exchange"]}'], 'o', color='black', markersize=5)
+    
+    ax2.set_title('Funding Rates by Exchange', fontsize=12)
+    ax2.set_ylabel('Daily Funding Rate (%)')
+    ax2.legend()
+    ax2.grid(True)
+    
+    # Plot 3: Cumulative returns comparison
+    ax3 = fig.add_subplot(spec[1, 1])
+    
+    # Plot dynamic strategy
+    ax3.plot(results['date'], results['dynamic_cumulative'] * 100, label='Dynamic', color='black', linewidth=2)
+    
+    # Plot static strategies
+    for exchange in result['avg_funding_by_exchange'].keys():
+        ax3.plot(results['date'], results[f'static_cumulative_{exchange}'] * 100, 
+                 label=f'Static {exchange}', color=exchange_colors.get(exchange, 'gray'), 
+                 alpha=0.7, linestyle='--')
+    
+    ax3.set_title('Cumulative Returns Comparison', fontsize=12)
+    ax3.set_ylabel('Return (%)')
+    ax3.legend()
+    ax3.grid(True)
+    
+    # Plot 4: Fee impact
+    ax4 = fig.add_subplot(spec[2, 0])
+    ax4.plot(results['date'], results['dynamic_funding_gross'].cumsum() * 100, label='Gross Returns', color='green')
+    ax4.plot(results['date'], results['dynamic_cumulative'] * 100, label='Net Returns', color='blue')
+    ax4.fill_between(results['date'], 
+                    results['dynamic_funding_gross'].cumsum() * 100, 
+                    results['dynamic_cumulative'] * 100, 
+                    color='red', alpha=0.3, label='Fee Impact')
+    ax4.set_title('Fee Impact on Returns', fontsize=12)
+    ax4.set_ylabel('Return (%)')
+    ax4.legend()
+    ax4.grid(True)
+    
+    # Plot 5: Exchange usage pie chart
+    ax5 = fig.add_subplot(spec[2, 1])
+    wedges, texts, autotexts = ax5.pie(
+        result['venue_usage'].values(), 
+        labels=result['venue_usage'].keys(),
+        autopct='%1.1f%%',
+        textprops={'fontsize': 10},
+        colors=[exchange_colors.get(ex, 'gray') for ex in result['venue_usage'].keys()]
+    )
+    ax5.set_title('Exchange Usage Distribution', fontsize=12)
+    
+    # Add stats as text
+    plt.tight_layout()
+    
+    # Format stats for display
+    dynamic_stats = stats['dynamic']
+    best_static = stats[f"static_{result['dynamic_vs_best_static']['best_static_exchange']}"]
+    
+    stats_text = (
+        f"== Dynamic Strategy ==\n"
+        f"Total Return: {dynamic_stats['total_return_pct']:.2f}%\n"
+        f"Ann. Return: {dynamic_stats['annualized_return_pct']:.2f}%\n"
+        f"Sharpe: {dynamic_stats['sharpe_ratio']:.2f}\n"
+        f"Switches: {dynamic_stats['num_switches']}\n"
+        f"Fees Paid: {dynamic_stats['total_fees_pct']:.2f}%\n\n"
+        f"== Best Static ({result['dynamic_vs_best_static']['best_static_exchange']}) ==\n"
+        f"Total Return: {best_static['total_return_pct']:.2f}%\n"
+        f"Ann. Return: {best_static['annualized_return_pct']:.2f}%\n"
+        f"Sharpe: {best_static['sharpe_ratio']:.2f}\n\n"
+        f"== Improvement ==\n"
+        f"Return: {result['dynamic_vs_best_static']['improvement_pct']:.2f}%\n"
+        f"Ann. Return: {result['dynamic_vs_best_static']['improvement_annual_pct']:.2f}%\n"
+        f"Period: {result['total_days']} days"
+    )
+    plt.figtext(0.01, 0.01, stats_text, fontsize=10, bbox=dict(facecolor='white', alpha=0.8))
+    
+    plt.show()
+    
+    return fig
+
+def create_venue_switching_report(result):
+    """
+    Generate a formatted report on the venue switching analysis
+    
+    Parameters:
+        result: Dict - Result from analyze_venue_switching_strategy
+    
+    Returns:
+        pd.DataFrame - Styled DataFrame with the report
+    """
+    import pandas as pd
+    
+    # Get the best static exchange name once to avoid nested f-strings
+    best_exchange = result['dynamic_vs_best_static']['best_static_exchange']
+    static_key = f'static_{best_exchange}'
+    
+    # Create sections for the report
+    sections = {
+        'Strategy Performance': [
+            ('Period', f"{result['total_days']} days ({result['years']:.2f} years)"),
+            ('Dynamic Strategy Total Return', f"{result['strategy_stats']['dynamic']['total_return_pct']:.2f}%"),
+            ('Dynamic Strategy Ann. Return', f"{result['strategy_stats']['dynamic']['annualized_return_pct']:.2f}%"),
+            ('Dynamic Strategy Sharpe', f"{result['strategy_stats']['dynamic']['sharpe_ratio']:.2f}"),
+            ('Best Static Strategy', best_exchange),
+            ('Best Static Return', f"{result['strategy_stats'][static_key]['total_return_pct']:.2f}%"),
+            ('Best Static Ann. Return', f"{result['strategy_stats'][static_key]['annualized_return_pct']:.2f}%"),
+            ('Return Improvement', f"{result['dynamic_vs_best_static']['improvement_pct']:.2f}%"),
+            ('Ann. Return Improvement', f"{result['dynamic_vs_best_static']['improvement_annual_pct']:.2f}%"),
+        ],
+        'Exchange Switching Details': [
+            ('Number of Switches', f"{result['strategy_stats']['dynamic']['num_switches']}"),
+            ('Avg Holding Period', f"{result['strategy_stats']['dynamic']['avg_holding_days']:.1f} days"),
+            ('Total Fees Paid', f"{result['strategy_stats']['dynamic']['total_fees_pct']:.2f}%"),
+            ('Fee Setting Used', f"{'Maker' if result['fee_settings']['use_maker_fee'] else 'Taker'} Fee ({result['fee_settings']['fee_used']:.4f}%)"),
+            ('Avg Funding Improvement on Switch', f"{result['avg_funding_improvement_on_switch']:.4f}%")
+        ],
+        'Exchange Stats': []
+    }
+    
+    # Add stats for each exchange
+    for exchange, avg_funding in result['avg_funding_by_exchange'].items():
+        usage_pct = result['venue_usage_pct'].get(exchange, 0)
+        exchange_key = f'static_{exchange}'
+        sections['Exchange Stats'].append(
+            (f"{exchange}", f"Avg Funding: {avg_funding:.4f}%, Used: {usage_pct:.1f}% of time, Return: {result['strategy_stats'][exchange_key]['total_return_pct']:.2f}%")
+        )
+    
+    # Create the report table
+    table_data = []
+    for section, items in sections.items():
+        table_data.append([section, ""])
+        for label, value in items:
+            table_data.append([f"  {label}", value])
+    
+    # Create DataFrame
+    df = pd.DataFrame(table_data, columns=['Metric', 'Value'])
+    
+    # Style the DataFrame
+    styled_df = df.style.set_properties(**{'text-align': 'left'})
+    
+    # Add row and section highlighting
+    styled_df = styled_df.apply(lambda x: ['background-color: #f2f2f2' if x.name % 2 == 0 
+                                          else 'background-color: white' for i in range(len(x))], axis=1)
+    
+    # Highlight section headers
+    def highlight_sections(x):
+        is_header = x["Metric"] in sections.keys()
+        return ['font-weight: bold; background-color: #d9e1f2' if is_header else '' for i in range(len(x))]
+    
+    styled_df = styled_df.apply(highlight_sections, axis=1)
+    
+    return styled_df
 
 
 
@@ -1173,3 +1606,429 @@ def display_statistics_table(btc_stats, eth_stats=None):
     display(HTML(styled_df.to_html()))
     
     return styled_df
+
+def separate_by_exchange(df):
+    """
+    Separates a dataframe containing mixed exchange data into separate dataframes by exchange.
+    
+    Parameters:
+        df: DataFrame containing data from multiple exchanges
+    
+    Returns:
+        dict: Dictionary mapping exchange names to their respective dataframes
+        
+    Example:
+        If your dataframe has columns like 'date', 'timestamp', 'FR_open', 'FR_close', 'perp_exchange', 'perp_symbol'
+        This function will separate it into multiple dataframes based on the exchange value
+    """
+    # Check dataframe structure
+    print(f"Input dataframe columns: {df.columns.tolist()}")
+    print(f"First few rows sample:")
+    print(df.head(2))
+    
+    # Find the exchange column
+    exchange_cols = []
+    for col in df.columns:
+        if 'exchange' in str(col).lower():
+            exchange_cols.append(col)
+    
+    if not exchange_cols:
+        raise ValueError("Could not find any column containing 'exchange' in the dataframe")
+    
+    # If multiple exchange columns are found, try to determine which to use
+    exchange_column = None
+    if len(exchange_cols) > 1:
+        # Prefer perp_exchange for funding rate analysis
+        if 'perp_exchange' in exchange_cols:
+            exchange_column = 'perp_exchange'
+        elif 'exchange' in exchange_cols:
+            exchange_column = 'exchange'
+        else:
+            exchange_column = exchange_cols[0]
+        print(f"Multiple exchange columns found: {exchange_cols}. Using '{exchange_column}'")
+    else:
+        exchange_column = exchange_cols[0]
+        print(f"Using exchange column: '{exchange_column}'")
+    
+    # Get unique exchanges
+    exchanges = df[exchange_column].unique()
+    print(f"Found {len(exchanges)} exchanges: {exchanges}")
+    
+    # Create result dictionary
+    exchange_dfs = {}
+    
+    # Split by exchange
+    for exchange in exchanges:
+        exchange_df = df[df[exchange_column] == exchange].copy().reset_index(drop=True)
+        exchange_dfs[exchange] = exchange_df
+        print(f"Created dataframe for {exchange} with {len(exchange_df)} rows")
+    
+    return exchange_dfs
+
+def analyze_multi_exchange_carry_trade(spot_df, futures_df, maker_fee=0.0, taker_fee=0.0):
+    """
+    Analyzes whether switching venues for the short leg of a carry trade improves performance.
+    Works with data structure from the process_data_files function.
+    
+    Parameters:
+        spot_df: DataFrame with spot price data across exchanges
+        futures_df: DataFrame with futures funding rate data across exchanges
+        maker_fee: Maker fee percentage
+        taker_fee: Taker fee percentage
+        
+    Returns:
+        Dictionary with analysis results
+    """
+    # First, let's identify and separate by exchange
+    if 'spot_exchange' in spot_df.columns:
+        spot_exchange_col = 'spot_exchange'
+    elif 'exchange' in spot_df.columns:
+        spot_exchange_col = 'exchange'
+    else:
+        raise ValueError("Could not identify exchange column in spot dataframe")
+        
+    if 'perp_exchange' in futures_df.columns:
+        futures_exchange_col = 'perp_exchange'
+    elif 'exchange' in futures_df.columns:
+        futures_exchange_col = 'exchange'
+    else:
+        raise ValueError("Could not identify exchange column in futures dataframe")
+    
+    # Get unique exchanges
+    spot_exchanges = spot_df[spot_exchange_col].unique()
+    futures_exchanges = futures_df[futures_exchange_col].unique()
+    
+    print(f"Spot exchanges: {spot_exchanges}")
+    print(f"Futures exchanges: {futures_exchanges}")
+    
+    # Separate by exchange
+    spot_by_exchange = {}
+    for exchange in spot_exchanges:
+        spot_by_exchange[exchange] = spot_df[spot_df[spot_exchange_col] == exchange].copy()
+        print(f"Created spot dataframe for {exchange} with {len(spot_by_exchange[exchange])} rows")
+        
+    futures_by_exchange = {}
+    for exchange in futures_exchanges:
+        futures_by_exchange[exchange] = futures_df[futures_df[futures_exchange_col] == exchange].copy()
+        print(f"Created futures dataframe for {exchange} with {len(futures_by_exchange[exchange])} rows")
+    
+    # Select reference exchange for spot
+    reference_exchange = spot_exchanges[0]  # Default to first exchange
+    reference_spot_df = spot_by_exchange[reference_exchange]
+    print(f"Using {reference_exchange} as reference spot exchange")
+    
+    # For each date, find the best futures exchange based on funding rate
+    # Prepare result dataframe
+    results = pd.DataFrame()
+    
+    # Ensure we have timestamps and date columns
+    for ex_df in [reference_spot_df] + list(futures_by_exchange.values()):
+        if 'timestamp' not in ex_df.columns:
+            if 'date' in ex_df.columns:
+                ex_df['timestamp'] = pd.to_datetime(ex_df['date']).astype(int) // 10**9
+            else:
+                raise ValueError("Neither timestamp nor date column found")
+                
+        if 'date' not in ex_df.columns:
+            ex_df['date'] = pd.to_datetime(ex_df['timestamp'], unit='s')
+    
+    # Get common dates (timestamps) across all exchanges
+    common_timestamps = set(reference_spot_df['timestamp'])
+    for ex_df in futures_by_exchange.values():
+        common_timestamps = common_timestamps.intersection(set(ex_df['timestamp']))
+    
+    common_timestamps = sorted(list(common_timestamps))
+    print(f"Found {len(common_timestamps)} common timestamps across exchanges")
+    
+    if len(common_timestamps) == 0:
+        raise ValueError("No common timestamps found across exchanges")
+    
+    # Create results dataframe with common timestamps
+    results = pd.DataFrame({'timestamp': common_timestamps})
+    results['date'] = pd.to_datetime(results['timestamp'], unit='s')
+    
+    # Add spot price
+    spot_prices = {}
+    for ts in common_timestamps:
+        row = reference_spot_df[reference_spot_df['timestamp'] == ts]
+        if not row.empty:
+            spot_prices[ts] = row['SP_close'].values[0]
+            
+    results['SP_close'] = results['timestamp'].map(spot_prices)
+    
+    # Add funding rates for each exchange
+    for exchange, ex_df in futures_by_exchange.items():
+        funding_rates = {}
+        for ts in common_timestamps:
+            row = ex_df[ex_df['timestamp'] == ts]
+            if not row.empty:
+                funding_rates[ts] = row['FR_close'].values[0]
+                
+        results[f'FR_{exchange}'] = results['timestamp'].map(funding_rates)
+    
+    # Implement dynamic venue switching strategy
+    window_size = 7  # Days to look back for signal
+    results['best_exchange'] = ''
+    results['current_exchange'] = list(futures_by_exchange.keys())[0]
+    results['switched_exchange'] = False
+    results['fee_paid'] = 0.0
+    
+    # Calculate funding return for static strategy on each exchange
+    for exchange in futures_by_exchange:
+        results[f'static_funding_{exchange}'] = results[f'FR_{exchange}'] / 100
+        results[f'static_cumulative_{exchange}'] = (1 + results[f'static_funding_{exchange}']).cumprod() - 1
+    
+    # Initialize dynamic strategy
+    results['dynamic_funding'] = 0.0
+    results['dynamic_funding_gross'] = 0.0
+    results['dynamic_cumulative'] = 0.0
+    
+    # Calculate which fee to use (maker or taker)
+    fee = maker_fee
+    
+    # Implement dynamic venue switching
+    for i in range(len(results)):
+        if i < window_size:
+            # Use first exchange for initial period
+            current_exchange = results['current_exchange'].iloc[i - 1] if i > 0 else list(futures_by_exchange.keys())[0]
+            results.loc[i, 'best_exchange'] = current_exchange
+            results.loc[i, 'current_exchange'] = current_exchange
+            results.loc[i, 'dynamic_funding'] = results.loc[i, f'FR_{current_exchange}'] / 100
+            results.loc[i, 'dynamic_funding_gross'] = results.loc[i, f'FR_{current_exchange}'] / 100
+        else:
+            current_exchange = results['current_exchange'].iloc[i - 1]
+            
+            # Calculate average funding for past window
+            avg_funding = {}
+            for exchange in futures_by_exchange:
+                avg_funding[exchange] = results.loc[i-window_size:i-1, f'FR_{exchange}'].mean()
+                
+            # Find best exchange
+            best_exchange = max(avg_funding, key=avg_funding.get)
+            results.loc[i, 'best_exchange'] = best_exchange
+            
+            # Determine if we should switch
+            should_switch = False
+            if best_exchange != current_exchange:
+                funding_advantage = avg_funding[best_exchange] - avg_funding[current_exchange]
+                switch_cost_pct = fee * 2  # Fee to close current position and open new one
+                
+                if funding_advantage > switch_cost_pct * window_size:
+                    should_switch = True
+                    
+            if should_switch:
+                results.loc[i, 'current_exchange'] = best_exchange
+                results.loc[i, 'switched_exchange'] = True
+                results.loc[i, 'fee_paid'] = fee * 2
+                results.loc[i, 'dynamic_funding_gross'] = results.loc[i, f'FR_{best_exchange}'] / 100
+                results.loc[i, 'dynamic_funding'] = results.loc[i, 'dynamic_funding_gross'] - fee * 2 / 100
+            else:
+                results.loc[i, 'current_exchange'] = current_exchange
+                results.loc[i, 'dynamic_funding_gross'] = results.loc[i, f'FR_{current_exchange}'] / 100
+                results.loc[i, 'dynamic_funding'] = results.loc[i, 'dynamic_funding_gross']
+    
+    # Calculate cumulative returns
+    results['dynamic_cumulative'] = (1 + results['dynamic_funding']).cumprod() - 1
+    
+    # Calculate strategy statistics
+    days = (results['date'].max() - results['date'].min()).days
+    years = days / 365
+    
+    # Dynamic strategy stats
+    dynamic_return = results['dynamic_cumulative'].iloc[-1] * 100
+    dynamic_annual_return = ((1 + dynamic_return/100) ** (1/years) - 1) * 100 if years > 0 else 0
+    dynamic_volatility = results['dynamic_funding'].std() * np.sqrt(252) * 100
+    dynamic_sharpe = dynamic_annual_return / dynamic_volatility if dynamic_volatility > 0 else 0
+    
+    strategy_stats = {
+        'dynamic': {
+            'total_return_pct': dynamic_return,
+            'annualized_return_pct': dynamic_annual_return,
+            'volatility_pct': dynamic_volatility,
+            'sharpe_ratio': dynamic_sharpe,
+            'num_switches': results['switched_exchange'].sum(),
+            'total_fees_pct': results['fee_paid'].sum(),
+        }
+    }
+    
+    # Static strategy stats
+    for exchange in futures_by_exchange:
+        static_return = results[f'static_cumulative_{exchange}'].iloc[-1] * 100
+        static_annual_return = ((1 + static_return/100) ** (1/years) - 1) * 100 if years > 0 else 0
+        static_volatility = results[f'static_funding_{exchange}'].std() * np.sqrt(252) * 100
+        static_sharpe = static_annual_return / static_volatility if static_volatility > 0 else 0
+        
+        strategy_stats[f'static_{exchange}'] = {
+            'total_return_pct': static_return,
+            'annualized_return_pct': static_annual_return,
+            'volatility_pct': static_volatility,
+            'sharpe_ratio': static_sharpe,
+            'total_fees_pct': 0.0,
+            'num_switches': 0
+        }
+    
+    # Find best static strategy
+    best_static_exchange = max(
+        [ex for ex in futures_by_exchange.keys()], 
+        key=lambda ex: strategy_stats[f'static_{ex}']['total_return_pct']
+    )
+    
+    best_static = strategy_stats[f'static_{best_static_exchange}']
+    
+    # Calculate improvement over best static
+    improvement_pct = dynamic_return - best_static['total_return_pct']
+    improvement_annual_pct = dynamic_annual_return - best_static['annualized_return_pct']
+    
+    # Venue usage analysis
+    venue_usage = results['current_exchange'].value_counts().to_dict()
+    venue_usage_pct = {k: (v / len(results) * 100) for k, v in venue_usage.items()}
+    
+    # Average funding by exchange
+    avg_funding_by_exchange = {}
+    for exchange in futures_by_exchange:
+        avg_funding_by_exchange[exchange] = results[f'FR_{exchange}'].mean()
+    
+    # Collect all results
+    result = {
+        'results_df': results,
+        'strategy_stats': strategy_stats,
+        'dynamic_vs_best_static': {
+            'improvement_pct': improvement_pct,
+            'improvement_annual_pct': improvement_annual_pct,
+            'best_static_exchange': best_static_exchange
+        },
+        'venue_usage': venue_usage,
+        'venue_usage_pct': venue_usage_pct,
+        'avg_funding_by_exchange': avg_funding_by_exchange,
+        'total_days': days,
+        'years': years,
+        'fee_settings': {
+            'maker_fee': maker_fee,
+            'taker_fee': taker_fee,
+            'fee_used': fee
+        }
+    }
+    
+    # Plot results
+    plot_venue_switching_results(result)
+    
+    # Return analysis
+    return result
+
+def plot_venue_switching_results(result):
+    """
+    Plot the results of the venue switching analysis
+    """
+    results = result['results_df']
+    stats = result['strategy_stats']
+    
+    fig = plt.figure(figsize=(16, 12))
+    spec = fig.add_gridspec(3, 2)
+    
+    # Plot 1: Asset price
+    ax1 = fig.add_subplot(spec[0, :])
+    ax1.plot(results['date'], results['SP_close'], label='Asset Price', color='blue')
+    
+    # Highlight exchange switches
+    switch_dates = results.loc[results['switched_exchange'], 'date']
+    for switch_date in switch_dates:
+        ax1.axvline(x=switch_date, color='gray', linestyle='--', alpha=0.5)
+    
+    # Add colored regions for current exchange
+    current_exchange = results['current_exchange'].iloc[0]
+    start_date = results['date'].iloc[0]
+    
+    # Create color map
+    exchanges = list(result['venue_usage'].keys())
+    colors = plt.cm.tab10(np.linspace(0, 1, len(exchanges)))
+    exchange_colors = {ex: colors[i] for i, ex in enumerate(exchanges)}
+    
+    for i in range(1, len(results)):
+        if results['current_exchange'].iloc[i] != current_exchange:
+            end_date = results['date'].iloc[i]
+            ax1.axvspan(start_date, end_date, alpha=0.2, color=exchange_colors[current_exchange])
+            
+            # Update for next segment
+            current_exchange = results['current_exchange'].iloc[i]
+            start_date = end_date
+    
+    # Add the last segment
+    ax1.axvspan(start_date, results['date'].iloc[-1], alpha=0.2, color=exchange_colors[current_exchange])
+    
+    ax1.set_title('Asset Price and Exchange Switching', fontsize=14)
+    ax1.set_ylabel('Price ($)')
+    
+    # Create legend
+    legend_handles = [plt.Rectangle((0,0),1,1, color=color, alpha=0.5) for color in exchange_colors.values()]
+    ax1.legend(handles=legend_handles, labels=exchanges, title="Active Exchange")
+    ax1.grid(True)
+    
+    # Plot 2: Funding rates by exchange
+    ax2 = fig.add_subplot(spec[1, 0])
+    for exchange in exchanges:
+        ax2.plot(results['date'], results[f'FR_{exchange}'], label=exchange)
+    
+    ax2.set_title('Funding Rates by Exchange', fontsize=12)
+    ax2.set_ylabel('Daily Funding Rate (%)')
+    ax2.legend()
+    ax2.grid(True)
+    
+    # Plot 3: Cumulative returns comparison
+    ax3 = fig.add_subplot(spec[1, 1])
+    
+    # Plot dynamic strategy
+    ax3.plot(results['date'], results['dynamic_cumulative'] * 100, label='Dynamic', color='black', linewidth=2)
+    
+    # Plot static strategies
+    for exchange in exchanges:
+        ax3.plot(results['date'], results[f'static_cumulative_{exchange}'] * 100, 
+                 label=f'Static {exchange}', color=exchange_colors.get(exchange, 'gray'), 
+                 alpha=0.7, linestyle='--')
+    
+    ax3.set_title('Cumulative Returns Comparison', fontsize=12)
+    ax3.set_ylabel('Return (%)')
+    ax3.legend()
+    ax3.grid(True)
+    
+    # Plot 4: Exchange usage pie chart
+    ax4 = fig.add_subplot(spec[2, 0])
+    wedges, texts, autotexts = ax4.pie(
+        result['venue_usage'].values(), 
+        labels=result['venue_usage'].keys(),
+        autopct='%1.1f%%',
+        textprops={'fontsize': 10},
+        colors=[exchange_colors.get(ex, 'gray') for ex in result['venue_usage'].keys()]
+    )
+    ax4.set_title('Exchange Usage Distribution', fontsize=12)
+    
+    # Plot 5: Statistics table
+    ax5 = fig.add_subplot(spec[2, 1])
+    ax5.axis('off')
+    
+    # Format stats for display
+    dynamic_stats = stats['dynamic']
+    best_static_exchange = result['dynamic_vs_best_static']['best_static_exchange']
+    best_static = stats[f'static_{best_static_exchange}']
+    
+    stats_text = (
+        f"== Dynamic Strategy ==\n"
+        f"Total Return: {dynamic_stats['total_return_pct']:.2f}%\n"
+        f"Ann. Return: {dynamic_stats['annualized_return_pct']:.2f}%\n"
+        f"Sharpe: {dynamic_stats['sharpe_ratio']:.2f}\n"
+        f"Switches: {dynamic_stats['num_switches']}\n"
+        f"Fees Paid: {dynamic_stats['total_fees_pct']:.2f}%\n\n"
+        f"== Best Static ({best_static_exchange}) ==\n"
+        f"Total Return: {best_static['total_return_pct']:.2f}%\n"
+        f"Ann. Return: {best_static['annualized_return_pct']:.2f}%\n"
+        f"Sharpe: {best_static['sharpe_ratio']:.2f}\n\n"
+        f"== Improvement ==\n"
+        f"Return: {result['dynamic_vs_best_static']['improvement_pct']:.2f}%\n"
+        f"Ann. Return: {result['dynamic_vs_best_static']['improvement_annual_pct']:.2f}%\n"
+        f"Period: {result['total_days']} days"
+    )
+    ax5.text(0.05, 0.95, stats_text, verticalalignment='top', fontsize=12)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return fig
