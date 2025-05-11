@@ -713,9 +713,31 @@ def calculate_period_statistics(df: pd.DataFrame) -> Dict[str, Any]:
     strategy_drawdown_series = (strategy_equity_curve - strategy_hwm) / strategy_hwm
     max_strategy_drawdown = strategy_drawdown_series.min() * 100
     
-    # Funding Rates Statistics
+    # Funding Rates Statistics - including min/max and negative periods
     avg_daily_funding = df['FR_close'].mean()
     annualized_funding = avg_daily_funding * 365
+    min_daily_funding = df['FR_close'].min()
+    max_daily_funding = df['FR_close'].max()
+    annualized_min_funding = min_daily_funding * 365
+    annualized_max_funding = max_daily_funding * 365
+
+    # Count days with negative funding rate
+    negative_days = (df['FR_close'] < 0).sum()
+    negative_days_pct = (negative_days / len(df)) * 100 if len(df) > 0 else 0
+    
+    # Average negative funding rate when it's negative
+    negative_funding = df[df['FR_close'] < 0]['FR_close'].mean() if (df['FR_close'] < 0).any() else 0
+    annualized_negative_funding = negative_funding * 365
+    
+    # Longest streak of negative funding days
+    streak_count = 0
+    max_streak = 0
+    for rate in df['FR_close']:
+        if rate < 0:
+            streak_count += 1
+            max_streak = max(max_streak, streak_count)
+        else:
+            streak_count = 0
     
     # Market Regime Analysis
     bull_days = df['bull_market'].sum()
@@ -762,9 +784,18 @@ def calculate_period_statistics(df: pd.DataFrame) -> Dict[str, Any]:
         'sharpe_ratio': sharpe_ratio,
         'max_strategy_drawdown_pct': max_strategy_drawdown,
         
-        # Funding rates
+       # Funding rates - enhanced
         'avg_daily_funding_pct': avg_daily_funding,
         'annualized_funding_pct': annualized_funding,
+        'min_daily_funding_pct': min_daily_funding,
+        'max_daily_funding_pct': max_daily_funding,
+        'annualized_min_funding_pct': annualized_min_funding,
+        'annualized_max_funding_pct': annualized_max_funding,
+        'negative_funding_days': negative_days,
+        'negative_funding_days_pct': negative_days_pct,
+        'avg_negative_funding_pct': negative_funding,
+        'annualized_negative_funding_pct': annualized_negative_funding,
+        'max_consecutive_negative_days': max_streak,
         
         # Market regime analysis
         'bull_market_days': bull_days,
@@ -834,23 +865,57 @@ def plot_carry_trade_performance(merged_df: pd.DataFrame, stats: dict, title: st
     # Plot 2: Funding rates (annualized)
     ax2 = fig.add_subplot(spec[1, 0])
     ax2.plot(merged_df['date'], merged_df['FR_annualized'], color='purple')
+    
+    # Highlight negative funding rate periods
+    negative_mask = merged_df['FR_close'] < 0
+    if negative_mask.any():
+        ax2.scatter(merged_df.loc[negative_mask, 'date'], 
+                   merged_df.loc[negative_mask, 'FR_annualized'], 
+                   color='red', s=20, label='Negative Funding')
+    
     ax2.set_title('Annualized Funding Rates', fontsize=12)
     ax2.set_ylabel('Annual Rate (%)')
-    ax2.axhline(y=stats['annualized_funding_pct'], color='r', linestyle='--', 
+    ax2.axhline(y=stats['annualized_funding_pct'], color='black', linestyle='-', 
                 label=f'Avg: {stats["annualized_funding_pct"]:.2f}%')
     ax2.axhline(y=stats['annualized_bull_funding'], color='g', linestyle='--', 
                 label=f'Bull Avg: {stats["annualized_bull_funding"]:.2f}%')
     ax2.axhline(y=stats['annualized_bear_funding'], color='orange', linestyle='--', 
                 label=f'Bear Avg: {stats["annualized_bear_funding"]:.2f}%')
+    
+    # Show min and max funding rates
+    ax2.axhline(y=stats['annualized_min_funding_pct'], color='red', linestyle=':', 
+                label=f'Min: {stats["annualized_min_funding_pct"]:.2f}%')
+    ax2.axhline(y=stats['annualized_max_funding_pct'], color='blue', linestyle=':', 
+                label=f'Max: {stats["annualized_max_funding_pct"]:.2f}%')
+    
     ax2.legend()
     ax2.grid(True)
     
     # Plot 3: Cumulative funding return
     ax3 = fig.add_subplot(spec[1, 1])
     ax3.plot(merged_df['date'], merged_df['funding_return'] * 100, color='green')
+    
+    # Highlight periods with negative funding
+    negative_regions = []
+    current_start = None
+    for idx, row in merged_df.iterrows():
+        if row['FR_close'] < 0 and current_start is None:
+            current_start = row['date']
+        elif row['FR_close'] >= 0 and current_start is not None:
+            negative_regions.append((current_start, row['date']))
+            current_start = None
+    
+    if current_start is not None:  # Handle case where we end with negative funding
+        negative_regions.append((current_start, merged_df['date'].iloc[-1]))
+        
+    for start, end in negative_regions:
+        ax3.axvspan(start, end, alpha=0.2, color='red', label='Negative Funding' if start == negative_regions[0][0] else '')
+    
     ax3.set_title('Cumulative Funding Return', fontsize=12)
     ax3.set_ylabel('Return (%)')
     ax3.grid(True)
+    if negative_regions:
+        ax3.legend()
     
     # Plot 4: Price drawdowns
     ax4 = fig.add_subplot(spec[2, 0])
@@ -872,28 +937,8 @@ def plot_carry_trade_performance(merged_df: pd.DataFrame, stats: dict, title: st
     
     plt.tight_layout()
     
-    # Add summary stats as text
-    summary_text = (
-        f"Period: {stats['start_date'].strftime('%Y-%m-%d')} to {stats['end_date'].strftime('%Y-%m-%d')} ({stats['days']} days)\n\n"
-        f"== Underlying Statistics ==\n"
-        f"Total Return: {stats['spot_return_pct']:.2f}%\n"
-        f"Annualized: {stats['spot_annualized_return_pct']:.2f}%\n"
-        f"Volatility: {stats['spot_volatility_pct']:.2f}%\n"
-        f"Max Drawdown: {stats['max_spot_drawdown_pct']:.2f}%\n\n"
-        f"== Strategy Statistics ==\n"
-        f"Funding Return: {stats['funding_return_pct']:.2f}%\n"
-        f"Annualized: {stats['annualized_funding_return_pct']:.2f}%\n"
-        f"Sharpe Ratio: {stats['sharpe_ratio']:.2f}\n"
-        f"Max Drawdown: {stats['max_strategy_drawdown_pct']:.2f}%\n\n"
-        f"== Market Regimes ==\n"
-        f"Bull Market: {stats['bull_market_pct']:.1f}% of days\n"
-        f"Bull Funding: {stats['annualized_bull_funding']:.2f}% p.a.\n"
-        f"Bear Funding: {stats['annualized_bear_funding']:.2f}% p.a.\n"
-        f"Price/Funding Corr: {stats['price_funding_correlation']:.2f}"
-    )
-    plt.figtext(0.01, 0.01, summary_text, fontsize=10, bbox=dict(facecolor='white', alpha=0.8))
-    
     plt.show()
+
 
 
 def separate_crypto_data(df, output_folder='src/data/concat'):
@@ -991,3 +1036,140 @@ def process_data_files(spot_file_path, futures_file_path):
         'btc_futures': btc_futures_df,
         'eth_futures': eth_futures_df
     }
+
+
+def display_statistics_table(btc_stats, eth_stats=None):
+    """
+    Display statistics in a nicely formatted table
+    
+    Parameters:
+        btc_stats: Dictionary of BTC statistics
+        eth_stats: Optional dictionary of ETH statistics for comparison
+    """
+    import pandas as pd
+    from IPython.display import display, HTML
+    
+    # Define the sections and metrics to include
+    sections = {
+        'Period Information': [
+            ('Start Date', 'start_date'),
+            ('End Date', 'end_date'),
+            ('Total Days', 'days'),
+            ('Years', 'years')
+        ],
+        'Price Information': [
+            ('Entry Price', 'entry_price'),
+            ('Exit Price', 'exit_price')
+        ],
+        'Underlying Asset Performance': [
+            ('Total Return', 'spot_return_pct', '%'),
+            ('Annualized Return', 'spot_annualized_return_pct', '%'),
+            ('Volatility (Annualized)', 'spot_volatility_pct', '%'),
+            ('Maximum Drawdown', 'max_spot_drawdown_pct', '%')
+        ],
+        'Strategy Performance': [
+            ('Total Funding Return', 'funding_return_pct', '%'),
+            ('Annualized Funding Return', 'annualized_funding_return_pct', '%'),
+            ('Sharpe Ratio', 'sharpe_ratio'),
+            ('Maximum Strategy Drawdown', 'max_strategy_drawdown_pct', '%')
+        ],
+        'Funding Rate Analysis': [
+            ('Average Daily Funding', 'avg_daily_funding_pct', '%'),
+            ('Annualized Average Funding', 'annualized_funding_pct', '%'),
+            ('Minimum Daily Funding', 'min_daily_funding_pct', '%'),
+            ('Maximum Daily Funding', 'max_daily_funding_pct', '%'),
+            ('Annualized Min Funding', 'annualized_min_funding_pct', '%'),
+            ('Annualized Max Funding', 'annualized_max_funding_pct', '%'),
+            ('Negative Funding Days', 'negative_funding_days', ' days'),
+            ('Negative Funding Days %', 'negative_funding_days_pct', '%'),
+            ('Average Negative Funding', 'avg_negative_funding_pct', '%'),
+            ('Annualized Negative Funding', 'annualized_negative_funding_pct', '%'),
+            ('Max Consecutive Negative Days', 'max_consecutive_negative_days', ' days')
+        ],
+        'Market Regime Analysis': [
+            ('Bull Market Days', 'bull_market_days', ' days'),
+            ('Bull Market %', 'bull_market_pct', '%'),
+            ('Bear Market Days', 'bear_market_days', ' days'),
+            ('Bull Market Daily Return', 'bull_market_daily_return', '%'),
+            ('Bear Market Daily Return', 'bear_market_daily_return', '%'),
+            ('Bull Market Daily Funding', 'bull_market_funding_rate', '%'),
+            ('Bear Market Daily Funding', 'bear_market_funding_rate', '%'),
+            ('Annualized Bull Market Funding', 'annualized_bull_funding', '%'),
+            ('Annualized Bear Market Funding', 'annualized_bear_funding', '%'),
+            ('Market Correction Days', 'correction_days', ' days'),
+            ('Correction Daily Funding', 'correction_funding_rate', '%'),
+            ('Price-Funding Correlation', 'price_funding_correlation')
+        ]
+    }
+    
+    # Create a list to store the table data
+    table_data = []
+    
+    # Process each section
+    for section, metrics in sections.items():
+        # Add section header
+        table_data.append([section, '' if eth_stats is None else ''])
+        
+        # Add each metric in the section
+        for metric_info in metrics:
+            if len(metric_info) == 2:
+                label, key = metric_info
+                suffix = ''
+            else:
+                label, key, suffix = metric_info
+            
+            btc_value = btc_stats.get(key, 'N/A')
+            
+            # Format the values for display
+            if isinstance(btc_value, (int, float)) and key not in ['days', 'years', 'negative_funding_days', 'max_consecutive_negative_days', 'bull_market_days', 'bear_market_days', 'correction_days']:
+                if suffix == '%':
+                    btc_formatted = f"{btc_value:.2f}{suffix}"
+                else:
+                    btc_formatted = f"{btc_value:.2f}{suffix}"
+            elif key in ['start_date', 'end_date']:
+                btc_formatted = str(btc_value).split()[0]
+            else:
+                btc_formatted = f"{btc_value}{suffix}"
+            
+            if eth_stats is not None:
+                eth_value = eth_stats.get(key, 'N/A')
+                if isinstance(eth_value, (int, float)) and key not in ['days', 'years', 'negative_funding_days', 'max_consecutive_negative_days', 'bull_market_days', 'bear_market_days', 'correction_days']:
+                    if suffix == '%':
+                        eth_formatted = f"{eth_value:.2f}{suffix}"
+                    else:
+                        eth_formatted = f"{eth_value:.2f}{suffix}"
+                elif key in ['start_date', 'end_date']:
+                    eth_formatted = str(eth_value).split()[0]
+                else:
+                    eth_formatted = f"{eth_value}{suffix}"
+                
+                table_data.append([f"  {label}", btc_formatted, eth_formatted])
+            else:
+                table_data.append([f"  {label}", btc_formatted])
+    
+    # Create DataFrame from the table data
+    if eth_stats is None:
+        columns = ['Metric', 'BTC Value']
+        df = pd.DataFrame(table_data, columns=columns)
+    else:
+        columns = ['Metric', 'BTC Value', 'ETH Value']
+        df = pd.DataFrame(table_data, columns=columns)
+    
+    # Style the DataFrame
+    styled_df = df.style.set_properties(**{'text-align': 'left'})
+    
+    # Add row and section highlighting
+    styled_df = styled_df.apply(lambda x: ['background-color: #f2f2f2' if x.name % 2 == 0 
+                                          else 'background-color: white' for i in range(len(x))], axis=1)
+    
+    # Highlight section headers
+    def highlight_sections(x):
+        is_header = x["Metric"] in sections.keys()
+        return ['font-weight: bold; background-color: #d9e1f2' if is_header else '' for i in range(len(x))]
+    
+    styled_df = styled_df.apply(highlight_sections, axis=1)
+    
+    # Display the styled table
+    display(HTML(styled_df.to_html()))
+    
+    return styled_df
