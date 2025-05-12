@@ -1041,6 +1041,11 @@ def create_venue_switching_report(result):
 
 #Added by Loris to compute carry trade performance
 
+
+
+
+#end
+
 def merge_and_compute_carry_trade(
     spot_df: pd.DataFrame,
     futures_df: pd.DataFrame,
@@ -1113,7 +1118,9 @@ def merge_and_compute_carry_trade(
     
     return merged_df
 
-def calculate_period_statistics(df: pd.DataFrame) -> Dict[str, Any]:
+def calculate_period_statistics(
+    df: pd.DataFrame, risk_free_rate: float = 0.0
+) -> Dict[str, Any]:
     """
     Calculate comprehensive statistics for the delta-neutral carry trade and underlying asset.
     """
@@ -1190,7 +1197,7 @@ def calculate_period_statistics(df: pd.DataFrame) -> Dict[str, Any]:
     price_funding_corr = df['daily_spot_return'].corr(df['FR_close'])
     
     # Sharpe Ratio calculation for the strategy (based on funding returns)
-    risk_free_rate = 0.02 / 252  # assuming 2% annual risk-free
+    # risk_free_rate = 0.02 / 252  # assuming 2% annual risk-free
     daily_excess_returns = df['daily_funding_return'] - risk_free_rate
     sharpe_ratio = (daily_excess_returns.mean() / daily_excess_returns.std()) * np.sqrt(252) if daily_excess_returns.std() > 0 else 0
     
