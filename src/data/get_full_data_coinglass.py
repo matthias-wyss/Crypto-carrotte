@@ -10,9 +10,8 @@ import glob
 import re
 import matplotlib.pyplot as plt
 from scipy import stats
-
-
-
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 
 class CoinGlassAPI:
@@ -1258,6 +1257,11 @@ def plot_carry_trade_performance(merged_df: pd.DataFrame, stats: dict, title: st
     """
     Plot comprehensive performance of the delta-neutral carry trade and underlying asset.
     """
+    # Create the folder for saving plots
+    folder_name = "plots"
+    if not os.path.exists(folder_name):
+        os.makedirs(folder_name, exist_ok=True)
+
     fig = plt.figure(figsize=(16, 12))
     spec = fig.add_gridspec(3, 2)
     
@@ -1296,10 +1300,17 @@ def plot_carry_trade_performance(merged_df: pd.DataFrame, stats: dict, title: st
         
     for start, end in correction_regions:
         ax1.axvspan(start, end, alpha=0.2, color='red')
+
+    # Create custom handles for the legend
+    legend_handles = [
+        Line2D([0], [0], color='blue', lw=2, label='Asset Price'),
+        Patch(color='green', alpha=0.2, label='Bull Market'),  # Green rectangle for Bull Market
+        Patch(color='red', alpha=0.2, label='Market Correction')  # Red rectangle for Market Correction
+    ]
         
     ax1.set_title('Asset Price with Market Regimes' if title is None else f'{title} Price with Market Regimes', fontsize=14)
     ax1.set_ylabel('Price ($)')
-    ax1.legend(['Asset Price', 'Bull Market', 'Market Correction'])
+    ax1.legend(handles=legend_handles)
     ax1.grid(True)
     
     # Plot 2: Funding rates (annualized)
@@ -1313,7 +1324,7 @@ def plot_carry_trade_performance(merged_df: pd.DataFrame, stats: dict, title: st
                    merged_df.loc[negative_mask, 'FR_annualized'], 
                    color='red', s=20, label='Negative Funding')
     
-    ax2.set_title('Annualized Funding Rates', fontsize=12)
+    ax2.set_title(f'Annualized Funding Rates' if title is None else f'{title} Annualized Funding Rates', fontsize=12)
     ax2.set_ylabel('Annual Rate (%)')
     ax2.axhline(y=stats['annualized_funding_pct'], color='black', linestyle='-', 
                 label=f'Avg: {stats["annualized_funding_pct"]:.2f}%')
@@ -1351,7 +1362,7 @@ def plot_carry_trade_performance(merged_df: pd.DataFrame, stats: dict, title: st
     for start, end in negative_regions:
         ax3.axvspan(start, end, alpha=0.2, color='red', label='Negative Funding' if start == negative_regions[0][0] else '')
     
-    ax3.set_title('Cumulative Funding Return', fontsize=12)
+    ax3.set_title(f'Cumulative Funding Return' if title is None else f'{title} Cumulative Funding Return', fontsize=12)
     ax3.set_ylabel('Return (%)')
     ax3.grid(True)
     if negative_regions:
@@ -1360,7 +1371,7 @@ def plot_carry_trade_performance(merged_df: pd.DataFrame, stats: dict, title: st
     # Plot 4: Price drawdowns
     ax4 = fig.add_subplot(spec[2, 0])
     ax4.fill_between(merged_df['date'], merged_df['drawdown_pct'], 0, color='red', alpha=0.3)
-    ax4.set_title('Underlying Asset Drawdown', fontsize=12)
+    ax4.set_title(f'Underlying Asset Drawdown' if title is None else f'{title} Underlying Asset Drawdown', fontsize=12)
     ax4.set_ylabel('Drawdown (%)')
     ax4.set_ylim(1.1 * merged_df['drawdown_pct'].min(), 5)  # Give some padding below min drawdown
     ax4.grid(True)
@@ -1371,11 +1382,13 @@ def plot_carry_trade_performance(merged_df: pd.DataFrame, stats: dict, title: st
     strategy_hwm = strategy_equity.cummax()
     strategy_dd = (strategy_equity - strategy_hwm) / strategy_hwm * 100
     ax5.fill_between(merged_df['date'], strategy_dd, 0, color='orange', alpha=0.3)
-    ax5.set_title('Strategy Drawdown', fontsize=12)
+    ax5.set_title(f'Strategy Drawdown' if title is None else f'{title} Strategy Drawdown', fontsize=12)
     ax5.set_ylabel('Drawdown (%)')
     ax5.grid(True)
     
     plt.tight_layout()
+
+    plt.savefig(f"{folder_name}/q3_{title.lower().replace(' - ', ' ').replace(' ', '_') if title else 'untitled'}.png")
     
     plt.show()
 
@@ -1672,7 +1685,7 @@ def separate_by_exchange(df):
     
     return exchange_dfs
 
-def analyze_multi_exchange_carry_trade(spot_df, futures_df, maker_fee=0.0, taker_fee=0.0):
+def analyze_multi_exchange_carry_trade(spot_df, futures_df, maker_fee=0.0, taker_fee=0.0, title=None):
     """
     Analyzes whether switching venues for the short leg of a carry trade improves performance.
     Works with data structure from the process_data_files function.
@@ -1682,6 +1695,7 @@ def analyze_multi_exchange_carry_trade(spot_df, futures_df, maker_fee=0.0, taker
         futures_df: DataFrame with futures funding rate data across exchanges
         maker_fee: Maker fee percentage
         taker_fee: Taker fee percentage
+        title: Optional title for the plots
         
     Returns:
         Dictionary with analysis results
@@ -1917,15 +1931,23 @@ def analyze_multi_exchange_carry_trade(spot_df, futures_df, maker_fee=0.0, taker
     }
     
     # Plot results
-    plot_venue_switching_results(result)
+    plot_venue_switching_results(result, title, maker_fee, taker_fee)
     
     # Return analysis
     return result
 
-def plot_venue_switching_results(result):
+def plot_venue_switching_results(result, title=None, maker_fee=0.0, taker_fee=0.0):
     """
     Plot the results of the venue switching analysis
     """
+    # Create the folder for saving plots
+    folder_name = "plots"
+    if not os.path.exists(folder_name):
+        os.makedirs(folder_name, exist_ok=True)
+
+    no_fee = maker_fee == 0.0 and taker_fee == 0.0
+    fee_info = "(no fees)" if no_fee else f"(maker fee: {maker_fee}, taker fee: {taker_fee})"
+
     results = result['results_df']
     stats = result['strategy_stats']
     
@@ -1962,7 +1984,7 @@ def plot_venue_switching_results(result):
     # Add the last segment
     ax1.axvspan(start_date, results['date'].iloc[-1], alpha=0.2, color=exchange_colors[current_exchange])
     
-    ax1.set_title('Asset Price and Exchange Switching', fontsize=14)
+    ax1.set_title(f'Asset Price and Exchange Switching {fee_info}' if title is None else f'{title} Price and Exchange Switching {fee_info}', fontsize=14)
     ax1.set_ylabel('Price ($)')
     
     # Create legend
@@ -1975,7 +1997,7 @@ def plot_venue_switching_results(result):
     for exchange in exchanges:
         ax2.plot(results['date'], results[f'FR_{exchange}'], label=exchange)
     
-    ax2.set_title('Funding Rates by Exchange', fontsize=12)
+    ax2.set_title(f'{title} Funding Rates by Exchange', fontsize=12)
     ax2.set_ylabel('Daily Funding Rate (%)')
     ax2.legend()
     ax2.grid(True)
@@ -1992,7 +2014,7 @@ def plot_venue_switching_results(result):
                  label=f'Static {exchange}', color=exchange_colors.get(exchange, 'gray'), 
                  alpha=0.7, linestyle='--')
     
-    ax3.set_title('Cumulative Returns Comparison', fontsize=12)
+    ax3.set_title(f'{title} Cumulative Returns Comparison {fee_info}', fontsize=12)
     ax3.set_ylabel('Return (%)')
     ax3.legend()
     ax3.grid(True)
@@ -2006,7 +2028,7 @@ def plot_venue_switching_results(result):
         textprops={'fontsize': 10},
         colors=[exchange_colors.get(ex, 'gray') for ex in result['venue_usage'].keys()]
     )
-    ax4.set_title('Exchange Usage Distribution', fontsize=12)
+    ax4.set_title(f'{title} Exchange Usage Distribution {fee_info}', fontsize=12)
     
     # Plot 5: Statistics table
     ax5 = fig.add_subplot(spec[2, 1])
@@ -2018,13 +2040,13 @@ def plot_venue_switching_results(result):
     best_static = stats[f'static_{best_static_exchange}']
     
     stats_text = (
-        f"== Dynamic Strategy ==\n"
+        f"== {title} Dynamic Strategy {fee_info} ==\n"
         f"Total Return: {dynamic_stats['total_return_pct']:.2f}%\n"
         f"Ann. Return: {dynamic_stats['annualized_return_pct']:.2f}%\n"
         f"Sharpe: {dynamic_stats['sharpe_ratio']:.2f}\n"
         f"Switches: {dynamic_stats['num_switches']}\n"
         f"Fees Paid: {dynamic_stats['total_fees_pct']:.2f}%\n\n"
-        f"== Best Static ({best_static_exchange}) ==\n"
+        f"== Best Static ({best_static_exchange}, {fee_info[1:-1]}) ==\n"
         f"Total Return: {best_static['total_return_pct']:.2f}%\n"
         f"Ann. Return: {best_static['annualized_return_pct']:.2f}%\n"
         f"Sharpe: {best_static['sharpe_ratio']:.2f}\n\n"
@@ -2036,6 +2058,10 @@ def plot_venue_switching_results(result):
     ax5.text(0.05, 0.95, stats_text, verticalalignment='top', fontsize=12)
     
     plt.tight_layout()
+
+    clean_fee_info = fee_info.replace('(', '').replace(')', '').replace(',', '').replace(':', '').replace(' ', '_').replace('.', '_')
+    plt.savefig(f"{folder_name}/q4_{title.lower() if title else 'untitled'}_{clean_fee_info}.png")
+
     plt.show()
     
     return fig
