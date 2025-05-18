@@ -19,6 +19,8 @@ This project investigates the implementation and performance of various **delta-
 
 We analyze the **historical profitability**, **market resilience**, and **risk characteristics** of the strategies across different market regimes, including the 2021 bull market, the Luna collapse, the FTX crisis and the ETF bullrun.
 
+<br>[📄 Read the full Project Report here](Project_report.pdf)<br>
+
 ---
 
 ## 📈 Strategies Implemented
