@@ -71,7 +71,7 @@ def plot_cumulative_funding_pnl(dfs: dict, filename="cumulative_funding_pnl.png"
         
         # Calculate the percentage of the initial PnL
         initial_pnl = df['cumulativeFundingPnL'].iloc[0]  # Initial position size PnL
-        df['cumulativeFundingPnL_pct'] = (df['cumulativeFundingPnL'] - initial_pnl) / (initial_pnl * 100)
+        df['cumulativeFundingPnL_pct'] = (df['cumulativeFundingPnL'] - initial_pnl) / (initial_pnl * 1000)
         
         # Plot the percentage PnL
         plt.plot(df['timestamp'], df['cumulativeFundingPnL_pct'], label=symbol)
@@ -286,7 +286,7 @@ def plot_annualized_return_comparison(df, filename="annualized_return_comparison
     save_path = os.path.join(image_dir, filename)
 
     # Estimate annualized funding return (assuming 8-hour funding rate)
-    annualized_funding = df['fundingRate'].mean() * 3 * 365  # 3 cycles per day
+    annualized_funding = df['fundingRate'].mean() * 3 * 365 * 100 # 3 cycles per day
     mean_staking_apr = df['Lido staking APR(instant)'].mean()
     combined_return = annualized_funding + mean_staking_apr
 
