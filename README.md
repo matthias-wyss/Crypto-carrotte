@@ -66,6 +66,7 @@ All data was collected from **Binance**, **CoinGlass API** and **Dune Analytics*
 
 ## 📂 Repository Structure
 
+```
 ├── data/ # Raw and processed datasets, includes some plots for Question 2
 ├── src/ # Python scripts implementing the crypto carry strategies
 ├── plots/ # Output plots for Questions 3 and 4
@@ -76,6 +77,7 @@ All data was collected from **Binance**, **CoinGlass API** and **Dune Analytics*
 ├── q4.ipynb # Notebook for visualizations and insights for Question 4
 ├── Project_report.pdf # Final project report (PDF)
 └── README.md # Project overview and structure
+```
 
 ---
 
