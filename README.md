@@ -99,7 +99,3 @@ All data was collected from **Binance**, **CoinGlass API** and **Dune Analytics*
 - Dune API key
 - CoinGlass API key
 
-To install dependencies:
-
-```bash
-pip install -r requirements.txt
