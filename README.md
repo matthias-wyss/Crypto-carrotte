@@ -67,16 +67,16 @@ All data was collected from **Binance**, **CoinGlass API** and **Dune Analytics*
 ## 📂 Repository Structure
 
 ```
-├── data/ # Raw and processed datasets, includes some plots for Question 2
-├── src/ # Python scripts implementing the crypto carry strategies
-├── plots/ # Output plots for Questions 3 and 4
-├── q2.ipynb # Notebook for plots and analysis related to Question 2
-├── q3.ipynb # Main notebook generating data for Questions 3 and 4
-├── q3_bis.ipynb # Supplementary visualizations for Question 3
-├── q3_staking.ipynb # ETH staking analysis (not included in the final report)
-├── q4.ipynb # Notebook for visualizations and insights for Question 4
-├── Project_report.pdf # Final project report (PDF)
-└── README.md # Project overview and structure
+├── data/                # Raw and processed datasets, includes some plots for Question 2
+├── src/                 # Python scripts implementing the crypto carry strategies
+├── plots/               # Output plots for Questions 3 and 4
+├── q2.ipynb             # Notebook for plots and analysis related to Question 2
+├── q3.ipynb             # Main notebook generating data for Questions 3 and 4
+├── q3_bis.ipynb         # Supplementary visualizations for Question 3
+├── q3_staking.ipynb     # ETH staking analysis (not included in the final report)
+├── q4.ipynb             # Notebook for visualizations and insights for Question 4
+├── Project_report.pdf   # Final project report (PDF)
+└── README.md            # Project overview and structure
 ```
 
 ---
